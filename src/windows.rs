@@ -9,14 +9,17 @@ use winreg::RegKey;
 
 const APP_NAME: &str = "COPE";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-#[allow(dead_code)]
-const DAEMON_PID_FILE: &str = "cope_daemon.pid";
+
+pub fn startup_command(exe_path: &std::path::Path) -> String {
+    format!("\"{}\" daemon", exe_path.display())
+}
 
 pub fn enable_startup() -> Result<()> {
-    let exe_path = current_exe_path()?;
+    let exe_path = installed_exe_path()?;
+    let cmd = startup_command(&exe_path);
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let run_key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
-    run_key.set_value(APP_NAME, &exe_path.to_string_lossy().to_string())?;
+    run_key.set_value(APP_NAME, &cmd)?;
     Ok(())
 }
 
@@ -30,21 +33,32 @@ pub fn disable_startup() -> Result<()> {
 pub fn is_startup_enabled() -> Result<bool> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let run_key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ)?;
-    Ok(run_key.get_value::<String, _>(APP_NAME).is_ok())
+    let value: String = match run_key.get_value(APP_NAME) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    Ok(value.trim_end().ends_with("daemon"))
 }
 
+#[allow(dead_code)]
 pub fn current_exe_path() -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(exe)
 }
 
-#[allow(dead_code)]
 pub fn installed_exe_path() -> Result<PathBuf> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("C:\\Users\\User\\AppData\\Local"));
     let path = local_app_data.join("COPE").join("cope.exe");
     Ok(path)
+}
+
+pub fn installed_cope_dir() -> Result<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Users\\User\\AppData\\Local"));
+    Ok(local_app_data.join("COPE"))
 }
 
 pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
@@ -56,7 +70,6 @@ pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
         .get_value::<String, _>("PATH")
         .unwrap_or_else(|_| String::new());
 
-    // Avoid duplicates (case-insensitive check) and remove the dir
     let dir_str = dir.to_string_lossy().to_string();
     let dir_str_lower = dir_str.to_lowercase();
 
@@ -71,7 +84,6 @@ pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
                 new_path.push_str(part_trimmed);
             }
         }
-        // Only set if changed
         if new_path != current_path {
             paths_key.set_value("PATH", &new_path)?;
         }
@@ -80,40 +92,22 @@ pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-pub fn start_background() -> Result<()> {
-    let config = crate::config::Config::load().unwrap_or_default();
-    let config = Arc::new(std::sync::RwLock::new(config));
-    let mut manager = HotkeyManager::new(config)?;
-    manager.register_hotkeys()?;
+pub fn start_background(exe_path: Option<PathBuf>) -> Result<()> {
+    let path = exe_path
+        .unwrap_or_else(|| installed_exe_path().expect("failed to determine installed exe path"));
 
-    let exe_path = current_exe_path()?;
-    let child = Command::new(&exe_path)
+    use std::process::Stdio;
+    let child = Command::new(&path)
         .arg("daemon")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
 
     let pid = child.id();
     let pid_path = daemon_pid_path()?;
     std::fs::write(&pid_path, pid.to_string())?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn test_hotkey_registration(config: &crate::config::Config) -> Result<()> {
-    use crate::hotkeys::HotkeyManager;
-    use std::sync::Arc;
-
-    let config = Arc::new(std::sync::RwLock::new(config.clone()));
-    let mut manager = HotkeyManager::new(config)?;
-    manager.register_hotkeys()?;
-
-    let failed = manager.get_failed_registrations();
-    if !failed.is_empty() {
-        for msg in failed {
-            eprintln!("Warning: {}", msg);
-        }
-    }
-
     Ok(())
 }
 
@@ -234,5 +228,23 @@ mod tests {
     fn test_installed_exe_path() {
         let path = installed_exe_path().unwrap();
         assert_eq!(path.file_name().unwrap().to_string_lossy(), "cope.exe");
+    }
+
+    #[test]
+    fn test_startup_command() {
+        let path = std::path::Path::new(r"C:\Users\foo\AppData\Local\COPE\cope.exe");
+        assert_eq!(
+            startup_command(path),
+            r#""C:\Users\foo\AppData\Local\COPE\cope.exe" daemon"#
+        );
+    }
+
+    #[test]
+    fn test_startup_command_spaces() {
+        let path = std::path::Path::new(r"C:\Users\John Doe\AppData\Local\COPE\cope.exe");
+        assert_eq!(
+            startup_command(path),
+            r#""C:\Users\John Doe\AppData\Local\COPE\cope.exe" daemon"#
+        );
     }
 }

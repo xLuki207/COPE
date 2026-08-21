@@ -1,14 +1,17 @@
 use crate::config::{config_dir, Config};
 use crate::routes::Destination;
 use crate::windows::{
-    disable_startup, enable_startup, is_daemon_running, is_startup_enabled, remove_from_user_path,
-    start_background, stop_daemon,
+    disable_startup, enable_startup, installed_cope_dir, is_daemon_running, is_startup_enabled,
+    remove_from_user_path, start_background, stop_daemon,
 };
 use anyhow::Result;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::sync::Arc;
+use winreg::enums::KEY_CREATE_SUB_KEY;
+use winreg::enums::KEY_READ;
+use winreg::enums::KEY_WRITE;
+use winreg::RegKey;
 
-const COPE_WORDMARK: &str = "COPE";
 const COPE_TAGLINE: &str = "route any CA. instantly.";
 const COPE_MEMECOIN_TAGLINE: &str = "built for the Solana trenches.";
 
@@ -52,10 +55,8 @@ pub struct Cli {
 
 impl Cli {
     pub fn parse() -> Self {
-        // Simple CLI parsing: cope <command>
         let args: Vec<String> = std::env::args().skip(1).collect();
         let command = if args.is_empty() {
-            // No command, print help and exit
             println!("{}", Self::help());
             std::process::exit(0);
         } else {
@@ -100,7 +101,7 @@ pub fn execute(cli: Cli) -> Result<()> {
         Commands::Status => cmd_status(),
         Commands::Uninstall => cmd_uninstall(),
         Commands::Install => cmd_install(),
-        Commands::Help => Ok(()), // handled below
+        Commands::Help => Ok(()),
         Commands::Daemon => Ok(()),
     }
 }
@@ -116,25 +117,70 @@ fn cmd_install() -> Result<()> {
     let start_with_windows =
         input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
 
-    let mut config = Config::load().unwrap_or_default();
+    let current_exe = std::env::current_exe()?;
 
-    // Ensure all 7 default routes exist (migrate from older configs)
-    config.ensure_default_routes();
+    let cope_dir = installed_cope_dir()?;
+    let installed_exe = cope_dir.join("cope.exe");
 
-    config.start_with_windows = start_with_windows;
+    std::fs::create_dir_all(&cope_dir)?;
+    std::fs::copy(&current_exe, &installed_exe)?;
+
+    let cope_dir_str = cope_dir.to_string_lossy().to_string();
+    let hkcu = RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    if let Ok(paths_key) =
+        hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE | KEY_CREATE_SUB_KEY)
+    {
+        let current_path = paths_key
+            .get_value::<String, _>("PATH")
+            .unwrap_or_else(|_| String::new());
+        let dir_lower = cope_dir_str.to_lowercase();
+        let already_present = current_path
+            .split(';')
+            .any(|e| e.trim().to_lowercase() == dir_lower);
+        if !already_present {
+            paths_key.set_value("PATH", &format!("{};{}", current_path, cope_dir_str))?;
+        }
+    }
 
     if start_with_windows {
         enable_startup()?;
         println!("Added to Windows startup.");
     }
 
+    let failed = {
+        let saved_level = log::max_level();
+        log::set_max_level(log::LevelFilter::Warn);
+        let check_config = Arc::new(std::sync::RwLock::new(Config::default()));
+        let mut check_manager = crate::hotkeys::HotkeyManager::new(check_config)?;
+        check_manager.register_hotkeys()?;
+        let f = check_manager.get_failed_registrations().to_vec();
+        drop(check_manager);
+        log::set_max_level(saved_level);
+        f
+    };
+
+    if !failed.is_empty() {
+        let _ = disable_startup();
+        let _ = remove_from_user_path(&cope_dir);
+        let _ = std::fs::remove_file(&installed_exe);
+        let _ = std::fs::remove_dir_all(&cope_dir);
+        eprintln!("COPE could not start.");
+        for msg in failed {
+            eprintln!("{}", msg);
+        }
+        anyhow::bail!("Hotkey registration failed");
+    }
+
+    let mut config = Config::load().unwrap_or_default();
+    config.ensure_default_routes();
+    config.start_with_windows = start_with_windows;
     config.save()?;
+
+    start_background(Some(installed_exe))?;
 
     println!("\nReady.");
     println!("COPE is running in the background.");
-    println!("Highlight a CA, press Alt+A/G/X/D/P/S to route.");
 
-    start_background()?;
     Ok(())
 }
 
@@ -145,7 +191,7 @@ fn cmd_start() -> Result<()> {
     }
 
     let _config = Config::load().unwrap_or_default();
-    start_background()?;
+    start_background(None)?;
     println!("COPE started.");
     Ok(())
 }
@@ -172,7 +218,6 @@ fn cmd_status() -> Result<()> {
         if startup { "Enabled" } else { "Disabled" }
     );
     println!("Config dir:  {}", config_dir()?.display());
-    println!();
     print_routes_table_with_status(&config);
     Ok(())
 }
@@ -190,20 +235,13 @@ fn cmd_uninstall() -> Result<()> {
     let _ = stop_daemon();
     let _ = disable_startup();
 
-    // Remove installed executable and COPE directory
-    let install_dir = config_dir()?;
-    if install_dir.exists() {
-        let _ = std::fs::remove_dir_all(&install_dir);
-    }
-
-    // Remove from current user PATH
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\Users\\User\\AppData\\Local"));
-    let cope_dir = local_app_data.join("COPE");
+    let cope_dir = installed_cope_dir()?;
     remove_from_user_path(&cope_dir)?;
 
-    // Remove config file if it still exists at old location
+    if cope_dir.exists() {
+        let _ = std::fs::remove_dir_all(&cope_dir);
+    }
+
     let config_path = Config::config_path()?;
     if config_path.exists() {
         let _ = std::fs::remove_file(&config_path);
@@ -214,20 +252,28 @@ fn cmd_uninstall() -> Result<()> {
 }
 
 fn print_branding() {
-    println!("{}", COPE_WORDMARK);
+    let c = "\x1b[38;2;0;200;255m";
+    let r = "\x1b[0m";
+    println!("{}   ██████╗ ██████╗ ██████╗ ███████╗{}", c, r);
+    println!("{}  ██╔════╝██╔═══██╗██╔══██╗██╔════╝{}", c, r);
+    println!("{}  ██║     ██║   ██║██████╔╝█████╗{}", c, r);
+    println!("{}  ██║     ██║   ██║██╔═══╝ ██╔══╝{}", c, r);
+    println!("{}  ╚██████╗╚██████╔╝██║     ███████╗{}", c, r);
+    println!("{}   ╚═════╝ ╚═════╝ ╚═╝     ╚══════╝{}", c, r);
     println!("{}", COPE_TAGLINE);
     println!("{}", COPE_MEMECOIN_TAGLINE);
     println!();
 }
 
 fn print_routes_table() {
-    println!("{:<14} Alt+A", "Axiom");
-    println!("{:<14} Alt+G", "GMGN");
-    println!("{:<14} Alt+X", "X Search");
-    println!("{:<14} Alt+D", "DexScreener");
-    println!("{:<14} Alt+P", "Pump.fun");
-    println!("{:<14} Alt+F", "FOMO");
-    println!("{:<14} Alt+S", "Solscan");
+    println!("ROUTES\n");
+    println!("{:<8} Axiom", "Alt+A");
+    println!("{:<8} GMGN", "Alt+G");
+    println!("{:<8} X Search", "Alt+X");
+    println!("{:<8} DexScreener", "Alt+D");
+    println!("{:<8} Pump.fun", "Alt+P");
+    println!("{:<8} FOMO", "Alt+F");
+    println!("{:<8} Solscan", "Alt+S");
 }
 
 fn print_routes_table_with_status(config: &Config) {

@@ -56,7 +56,7 @@ impl Destination {
     pub fn build_url(&self, address: &SolanaAddress) -> String {
         let addr = address.as_str();
         match self {
-            Destination::Axiom => format!("https://axiom.trade/meme/{}?chain=sol", addr),
+            Destination::Axiom => format!("https://axiom.trade/meme/{}?chain=sol&pulseChains=sol&trackerChains=sol,robinhood,bnb,eth", addr),
             Destination::Gmgn => format!("https://gmgn.ai/sol/token/{}", addr),
             Destination::XSearch => format!("https://x.com/search?q={}&src=typed_query", addr),
             Destination::DexScreener => format!("https://dexscreener.com/solana/{}", addr),
@@ -178,7 +178,7 @@ mod tests {
 
         assert_eq!(
             Destination::Axiom.build_url(&addr),
-            format!("https://axiom.trade/meme/{}?chain=sol", VALID_CA_1)
+            format!("https://axiom.trade/meme/{}?chain=sol&pulseChains=sol&trackerChains=sol,robinhood,bnb,eth", VALID_CA_1)
         );
         assert_eq!(
             Destination::Gmgn.build_url(&addr),
