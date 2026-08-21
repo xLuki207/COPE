@@ -1,0 +1,33 @@
+/target/
+/dist/
+*.pdb
+*.exe.local
+
+# Installer downloads
+temporary binaries/
+rustup-init.exe
+vs_BuildTools.exe
+
+# Local test artifacts
+/temp-logs/
+
+# Release artifacts (ignored in repo)
+/dist/
+
+# COPE data directory (per-user, not committed)
+# %LOCALAPPDATA%\COPE\ contents are not committed
+
+# IDE/vscode
+.vscode/
+.idea/
+
+# Backup files
+*.rs.bak
+*.rs.orig
+# Local build/test artifacts
+cope-preview.exe
+temp_*.log
+temp_*.txt
+*.pdb
+/target/
+/dist/

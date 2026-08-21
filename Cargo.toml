@@ -1,0 +1,61 @@
+[package]
+name = "cope"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny local utility for Solana memecoin traders - instant CA routing via hotkeys"
+license = "MIT"
+
+[dependencies]
+# Windows API bindings
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Graphics_Gdi",
+] }
+# Clipboard access
+arboard = "3.6"
+# Base58 encoding/decoding for Solana addresses
+bs58 = "0.5"
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Directories for config storage
+directories = "5.0"
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+# Logging
+env_logger = "0.11"
+log = "0.4"
+# Single instance mutex
+single-instance = "0.3"
+# URL opening
+open = "5.0"
+# Windows registry
+winreg = "0.52"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[[bin]]
+name = "cope"
+path = "src/main.rs"
