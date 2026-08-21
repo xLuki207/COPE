@@ -81,7 +81,6 @@ Commands:
   uninstall    Remove COPE
 
 Hotkeys:
-  Alt+A        Axiom
   Alt+G        GMGN
   Alt+X        X Search
   Alt+D        DexScreener
@@ -267,7 +266,6 @@ fn print_branding() {
 
 fn print_routes_table() {
     println!("ROUTES\n");
-    println!("{:<8} Axiom", "Alt+A");
     println!("{:<8} GMGN", "Alt+G");
     println!("{:<8} X Search", "Alt+X");
     println!("{:<8} DexScreener", "Alt+D");

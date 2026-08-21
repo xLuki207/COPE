@@ -18,7 +18,6 @@ pub enum Destination {
 impl Destination {
     pub fn all() -> &'static [Destination] {
         &[
-            Destination::Axiom,
             Destination::Gmgn,
             Destination::XSearch,
             Destination::DexScreener,
@@ -31,7 +30,7 @@ impl Destination {
     pub fn default_hotkey(&self) -> Option<(&'static str, u32, u32)> {
         use windows::Win32::UI::Input::KeyboardAndMouse::*;
         match self {
-            Destination::Axiom => Some(("Alt+A", MOD_ALT.0, u32::from(VK_A.0))),
+            Destination::Axiom => None,
             Destination::Gmgn => Some(("Alt+G", MOD_ALT.0, u32::from(VK_G.0))),
             Destination::XSearch => Some(("Alt+X", MOD_ALT.0, u32::from(VK_X.0))),
             Destination::DexScreener => Some(("Alt+D", MOD_ALT.0, u32::from(VK_D.0))),
@@ -177,10 +176,6 @@ mod tests {
         let addr = SolanaAddress(VALID_CA_1.to_string());
 
         assert_eq!(
-            Destination::Axiom.build_url(&addr),
-            format!("https://axiom.trade/meme/{}?chain=sol&pulseChains=sol&trackerChains=sol,robinhood,bnb,eth", VALID_CA_1)
-        );
-        assert_eq!(
             Destination::Gmgn.build_url(&addr),
             format!("https://gmgn.ai/sol/token/{}", VALID_CA_1)
         );
@@ -208,7 +203,6 @@ mod tests {
 
     #[test]
     fn test_from_str() {
-        assert_eq!(Destination::from_str("axiom"), Some(Destination::Axiom));
         assert_eq!(Destination::from_str("gmgn"), Some(Destination::Gmgn));
         assert_eq!(Destination::from_str("xsearch"), Some(Destination::XSearch));
         assert_eq!(
@@ -227,10 +221,6 @@ mod tests {
 
     #[test]
     fn test_default_hotkeys() {
-        assert_eq!(
-            Destination::Axiom.default_hotkey(),
-            Some(("Alt+A", 0x0001, 0x41))
-        );
         assert_eq!(
             Destination::Gmgn.default_hotkey(),
             Some(("Alt+G", 0x0001, 0x47))

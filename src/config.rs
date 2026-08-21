@@ -52,7 +52,7 @@ impl Config {
         self.routes.enabled_routes()
     }
 
-    /// Ensure all 7 default routes exist in the config.
+    /// Ensure all 6 default routes exist in the config.
     /// Migrates older configs that are missing the FOMO route or other defaults.
     pub fn ensure_default_routes(&mut self) -> bool {
         let mut changed = false;
@@ -83,7 +83,7 @@ mod tests {
         let config = Config::default();
         assert!(!config.start_with_windows);
         assert!(!config.show_notifications);
-        assert_eq!(config.routes.routes.len(), 7);
+        assert_eq!(config.routes.routes.len(), 6);
     }
 
     #[test]

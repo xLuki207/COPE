@@ -93,6 +93,10 @@ pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
 }
 
 pub fn start_background(exe_path: Option<PathBuf>) -> Result<()> {
+    if is_daemon_running()? {
+        anyhow::bail!("COPE daemon is already running.");
+    }
+
     let path = exe_path
         .unwrap_or_else(|| installed_exe_path().expect("failed to determine installed exe path"));
 
@@ -149,31 +153,74 @@ pub fn ensure_single_instance() -> Result<single_instance::SingleInstance> {
     Ok(instance)
 }
 
-pub fn stop_daemon() -> Result<bool> {
-    let pid_path = daemon_pid_path()?;
-    if !pid_path.exists() {
-        return Ok(false);
-    }
-
-    let pid_str = std::fs::read_to_string(&pid_path)?;
-    let pid: u32 = pid_str.trim().parse().unwrap_or(0);
-
-    if pid == 0 {
-        let _ = std::fs::remove_file(&pid_path);
-        return Ok(false);
-    }
-
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+fn is_pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, false, pid)?;
-        if !handle.is_invalid() {
-            TerminateProcess(handle, 0)?;
-            let _ = std::fs::remove_file(&pid_path);
-            return Ok(true);
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return false,
+        };
+
+        let mut exit_code = 0u32;
+        let result = GetExitCodeProcess(handle, &mut exit_code);
+        let _ = CloseHandle(handle);
+
+        result.is_ok() && exit_code == 259 // STILL_ACTIVE
+    }
+}
+
+fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return None,
+        };
+
+        let mut buf = vec![0u16; 520];
+        let mut size = buf.len() as u32;
+
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+
+        let _ = CloseHandle(handle);
+
+        if result.is_ok() && size > 0 {
+            let path_str = String::from_utf16_lossy(&buf[..size as usize]);
+            Some(PathBuf::from(path_str))
+        } else {
+            None
         }
     }
-    Ok(false)
+}
+
+fn is_pid_cope_daemon(pid: u32) -> bool {
+    let installed_path = match installed_exe_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let installed_str = installed_path.to_string_lossy().to_lowercase();
+
+    if let Some(exe_path) = get_process_exe_path(pid) {
+        let exe_str = exe_path.to_string_lossy().to_lowercase();
+        exe_str == installed_str
+    } else {
+        false
+    }
 }
 
 pub fn is_daemon_running() -> Result<bool> {
@@ -183,34 +230,81 @@ pub fn is_daemon_running() -> Result<bool> {
     }
 
     let pid_str = std::fs::read_to_string(&pid_path)?;
-    let pid: u32 = pid_str.trim().parse().unwrap_or(0);
+    let pid: u32 = match pid_str.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(false);
+        }
+    };
 
     if pid == 0 {
         let _ = std::fs::remove_file(&pid_path);
         return Ok(false);
     }
 
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if !is_pid_alive(pid) || !is_pid_cope_daemon(pid) {
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+pub fn stop_daemon() -> Result<bool> {
+    let pid_path = daemon_pid_path()?;
+    if !pid_path.exists() {
+        return Ok(false);
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_path)?;
+    let pid: u32 = match pid_str.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(false);
+        }
+    };
+
+    if pid == 0 {
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(false);
+    }
+
+    if !is_pid_cope_daemon(pid) {
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(false);
+    }
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        match handle {
-            Ok(h) => {
-                if !h.is_invalid() {
-                    let mut exit_code = 0u32;
-                    use windows::Win32::System::Threading::GetExitCodeProcess;
-                    let _ = GetExitCodeProcess(h, &mut exit_code);
-                    use windows::Win32::Foundation::CloseHandle;
-                    let _ = CloseHandle(h);
-                    return Ok(exit_code == 259); // STILL_ACTIVE
-                }
-            }
-            Err(_) => {
+        let handle = match OpenProcess(PROCESS_TERMINATE, false, pid) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
                 let _ = std::fs::remove_file(&pid_path);
+                return Ok(false);
             }
+        };
+
+        let result = TerminateProcess(handle, 0);
+        let _ = CloseHandle(handle);
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(false);
         }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        if is_pid_alive(pid) {
+            anyhow::bail!("COPE daemon process {} could not be terminated.", pid);
+        }
+
+        let _ = std::fs::remove_file(&pid_path);
+        Ok(true)
     }
-    Ok(false)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ COPE is a local-only Windows utility for routing Solana memecoin contract addres
 
 - **Opens URLs in default browser** - When a CA is identified, COPE constructs a URL and opens it in your Windows default browser. No on-chain verification is performed.
 
-- **Global hotkey handling** - COPE only attempts text capture when a configured global hotkey (Alt+A/G/X/D/P/S) is pressed. It does not continuously monitor the clipboard or keyboard.
+- **Global hotkey handling** - COPE only attempts text capture when a configured global hotkey (Alt+G/X/D/P/F/S) is pressed. It does not continuously monitor the clipboard or keyboard.
 
 - **Per-user installation** - COPE installs to `%LOCALAPPDATA%\COPE\` and modifies only the current user's PATH and startup registry. No administrator permissions are required.
 

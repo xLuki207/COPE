@@ -12,7 +12,6 @@ COPE opens it in your Windows default browser.
 
 | Hotkey   | Destination |
 |----------|-------------|
-| Alt+A    | Axiom       |
 | Alt+G    | GMGN        |
 | Alt+X    | X Search    |
 | Alt+D    | DexScreener |
