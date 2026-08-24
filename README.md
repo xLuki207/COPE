@@ -22,9 +22,17 @@ default browser. No dashboard, extension, wallet, account, or telemetry.
 ## Install
 
 1. Download `cope-windows-x64.exe` from GitHub Releases.
-2. Open PowerShell in the download folder and run:
+2. Open PowerShell and go to your Downloads folder:
 
+   ```powershell
+   cd $HOME\Downloads
+   ```
+
+3. Install COPE:
+
+   ```powershell
    .\cope-windows-x64.exe install
+   ```
 
 After installation, open a new terminal to use the `cope` command.
 
