@@ -83,18 +83,24 @@ impl Config {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
+    let dir = configured_data_dir()?;
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Return COPE's canonical per-user data directory without creating it.
+///
+/// Uninstall cleanup uses this form so a completed uninstall cannot recreate
+/// the directory merely by checking for leftover state.
+pub fn configured_data_dir() -> Result<PathBuf> {
     if let Ok(test_dir) = std::env::var("COPE_TEST_DATA_DIR") {
-        let dir = PathBuf::from(test_dir);
-        fs::create_dir_all(&dir)?;
-        return Ok(dir);
+        return Ok(PathBuf::from(test_dir));
     }
 
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is not available"))?;
-    let dir = local_app_data.join("COPE");
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
+    Ok(local_app_data.join("COPE"))
 }
 
 #[cfg(test)]

@@ -3,7 +3,8 @@ use crate::history::History;
 use crate::routes::Destination;
 use crate::windows::{
     disable_startup, enable_startup, installed_cope_dir, is_daemon_running, is_startup_enabled,
-    remove_from_user_path, start_background, stop_daemon,
+    remove_cope_dir_if_empty, remove_from_user_path, remove_owned_data_files,
+    schedule_deferred_cleanup, start_background, stop_daemon, verified_cope_dir,
 };
 use anyhow::Result;
 use std::io::{self, Write};
@@ -32,6 +33,7 @@ pub enum Commands {
     Uninstall,
     History { all: bool, clear: bool },
     Daemon,
+    Cleanup { parent_pid: u32 },
     Help,
     Version,
 }
@@ -51,6 +53,10 @@ impl Commands {
             }
             Some("help") => Some(Commands::Help),
             Some("daemon") => Some(Commands::Daemon),
+            Some("__cope_cleanup") => args
+                .get(1)
+                .and_then(|pid| pid.parse().ok())
+                .map(|parent_pid| Commands::Cleanup { parent_pid }),
             Some("--version") | Some("-v") => Some(Commands::Version),
             Some("--help") | Some("-h") => Some(Commands::Help),
             _ => None,
@@ -114,6 +120,7 @@ pub fn execute(cli: Cli) -> Result<()> {
         Commands::Uninstall => cmd_uninstall(),
         Commands::Install => cmd_install(),
         Commands::History { all, clear } => cmd_history(all, clear),
+        Commands::Cleanup { parent_pid } => crate::windows::run_deferred_cleanup(parent_pid),
         Commands::Help | Commands::Daemon | Commands::Version => Ok(()),
     }
 }
@@ -131,7 +138,8 @@ fn cmd_install() -> Result<()> {
 
     let current_exe = std::env::current_exe()?;
 
-    let cope_dir = installed_cope_dir()?;
+    installed_cope_dir()?;
+    let cope_dir = verified_cope_dir()?;
     let installed_exe = cope_dir.join("cope.exe");
 
     if is_daemon_running()? {
@@ -277,7 +285,7 @@ fn cmd_status() -> Result<()> {
 }
 
 fn cmd_uninstall() -> Result<()> {
-    print!("Remove COPE from startup and delete config? [y/N] ");
+    print!("Remove COPE and its local data? [y/N] ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -290,15 +298,20 @@ fn cmd_uninstall() -> Result<()> {
         eprintln!("{R}Cannot stop COPE daemon: {e}{RESET}");
         anyhow::bail!("Failed to stop existing daemon");
     }
-    let _ = disable_startup();
+    disable_startup()?;
 
     let cope_dir = installed_cope_dir()?;
     remove_from_user_path(&cope_dir)?;
 
-    // Remove all COPE-owned local state: exe, config, history, PID file.
-    // Everything lives under %LOCALAPPDATA%\COPE.
-    if cope_dir.exists() {
-        let _ = std::fs::remove_dir_all(&cope_dir);
+    // Remove only files COPE owns. The running installed executable is
+    // deferred to a native helper because Windows keeps its image open.
+    remove_owned_data_files(&cope_dir)?;
+    let installed_exe = cope_dir.join("cope.exe");
+    if installed_exe.exists() {
+        schedule_deferred_cleanup(&installed_exe)?;
+    }
+    if !installed_exe.exists() {
+        let _ = remove_cope_dir_if_empty(&cope_dir)?;
     }
 
     println!("{R}COPE uninstalled.{RESET}");

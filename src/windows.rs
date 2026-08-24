@@ -4,6 +4,7 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::{fs, io};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
 use winreg::enums::*;
@@ -42,7 +43,9 @@ pub fn enable_startup() -> Result<()> {
 
 pub fn disable_startup() -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let run_key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
+    let Ok(run_key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) else {
+        return Ok(());
+    };
     let _ = run_key.delete_value(APP_NAME);
     Ok(())
 }
@@ -72,6 +75,262 @@ pub fn installed_cope_dir() -> Result<PathBuf> {
     crate::config::config_dir()
 }
 
+const OWNED_DATA_FILES: [&str; 3] = ["config.json", "history.jsonl", "daemon.pid"];
+const CLEANUP_COMMAND: &str = "__cope_cleanup";
+
+/// Return the canonical COPE directory, refusing to follow a redirected path
+/// outside the configured per-user location.
+pub fn verified_cope_dir() -> Result<PathBuf> {
+    let configured = crate::config::configured_data_dir()?;
+    let canonical = fs::canonicalize(&configured)?;
+
+    if std::env::var_os("COPE_TEST_DATA_DIR").is_none() {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is not available"))?;
+        let expected = fs::canonicalize(local_app_data)?.join("COPE");
+        if !same_path(&canonical, &expected) {
+            anyhow::bail!(
+                "Refusing to clean redirected COPE data directory {}",
+                canonical.display()
+            );
+        }
+    }
+
+    Ok(canonical)
+}
+
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+pub fn remove_owned_data_files(dir: &std::path::Path) -> Result<()> {
+    for name in OWNED_DATA_FILES {
+        let path = dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to remove COPE-owned file {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove COPE's directory only when it is empty. User-created siblings are
+/// deliberately retained.
+pub fn remove_cope_dir_if_empty(dir: &std::path::Path) -> Result<bool> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+
+    if fs::read_dir(dir)?.next().is_some() {
+        return Ok(false);
+    }
+
+    fs::remove_dir(dir)?;
+    Ok(true)
+}
+
+fn cleanup_helper_path() -> Result<PathBuf> {
+    let current_exe = current_exe_path()?;
+    let pid = std::process::id();
+    let temp_dir = std::env::temp_dir();
+
+    for suffix in 0..100u32 {
+        let path = temp_dir.join(format!("cope-uninstall-{pid}-{suffix}.exe"));
+        let mut output = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut input = fs::File::open(&current_exe)?;
+        io::copy(&mut input, &mut output)?;
+        io::Write::flush(&mut output)?;
+        return Ok(path);
+    }
+
+    anyhow::bail!("Could not allocate a unique COPE cleanup helper path")
+}
+
+/// Schedule deletion of the running installed executable and cleanup of its
+/// data directory. The helper is a private copy of COPE in the user temp
+/// directory and exits after the parent releases its image; a bounded Windows
+/// cleanup process then removes the helper itself.
+pub fn schedule_deferred_cleanup(installed_exe: &std::path::Path) -> Result<()> {
+    if std::env::var("COPE_TEST_FAIL_UNINSTALL_SCHEDULE").as_deref() == Ok("1") {
+        anyhow::bail!("test failure: deferred uninstall cleanup was not scheduled");
+    }
+
+    let current_exe = current_exe_path()?;
+    let current_canonical = fs::canonicalize(current_exe)?;
+    let installed_canonical = fs::canonicalize(installed_exe)?;
+
+    if !same_path(&current_canonical, &installed_canonical) {
+        fs::remove_file(installed_exe)?;
+        return Ok(());
+    }
+
+    let helper_path = cleanup_helper_path()?;
+    let child_result = Command::new(&helper_path)
+        .arg(CLEANUP_COMMAND)
+        .arg(std::process::id().to_string())
+        .creation_flags(0x08000000)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    match child_result {
+        Ok(_) => {}
+        Err(error) => {
+            let _ = fs::remove_file(&helper_path);
+            return Err(error.into());
+        }
+    };
+
+    Ok(())
+}
+
+fn wait_for_parent_exit(parent_pid: u32) -> Result<()> {
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            parent_pid,
+        )
+    };
+    match handle {
+        Ok(handle) if !handle.is_invalid() => {
+            if verify_handle_is_cope_daemon(handle) {
+                let wait_result = unsafe { WaitForSingleObject(handle, 30_000) };
+                if wait_result == WAIT_TIMEOUT {
+                    let _ = unsafe { CloseHandle(handle) };
+                    anyhow::bail!("COPE uninstall helper timed out waiting for its parent");
+                }
+                if wait_result != WAIT_OBJECT_0 {
+                    let _ = unsafe { CloseHandle(handle) };
+                    anyhow::bail!("COPE uninstall helper could not wait for its parent");
+                }
+            }
+            let _ = unsafe { CloseHandle(handle) };
+        }
+        _ => {
+            // The parent may have exited between spawning this helper and
+            // opening its process handle. No wait is needed in that case.
+        }
+    }
+    Ok(())
+}
+
+fn schedule_helper_self_delete(path: &std::path::Path) -> Result<()> {
+    let temp_dir = fs::canonicalize(std::env::temp_dir())?;
+    let canonical_path = fs::canonicalize(path)?;
+    if canonical_path.parent() != Some(temp_dir.as_path())
+        || !canonical_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("cope-uninstall-") && name.ends_with(".exe"))
+    {
+        anyhow::bail!(
+            "Refusing to schedule deletion of unverified COPE cleanup helper {}",
+            canonical_path.display()
+        );
+    }
+
+    let path_string = canonical_path.to_string_lossy();
+    if !path_string.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, ':' | '\\' | '/' | '_' | '-' | '.' | ' ' | '~')
+    }) {
+        anyhow::bail!(
+            "Refusing to pass unsafe COPE cleanup helper path to Windows cleanup: {}",
+            canonical_path.display()
+        );
+    }
+
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("SystemRoot is not available"))?;
+    if !system_root.to_string_lossy().chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, ':' | '\\' | '/' | '_' | '-' | '.' | ' ' | '~')
+    }) {
+        anyhow::bail!("Refusing unsafe Windows system path for cleanup");
+    }
+    let cmd = system_root.join("System32").join("cmd.exe");
+    let ping = system_root.join("System32").join("ping.exe");
+    if !cmd.is_file() || !ping.is_file() {
+        anyhow::bail!("Windows cleanup tools are unavailable");
+    }
+    let cleanup_attempt = format!(
+        "\"{}\" 127.0.0.1 -n 2 > nul & del /f /q \"{}\"",
+        ping.display(),
+        canonical_path.display()
+    );
+    let command_line = (0..5)
+        .map(|_| cleanup_attempt.as_str())
+        .collect::<Vec<_>>()
+        .join(" & ");
+    Command::new(&cmd)
+        .arg("/D")
+        .arg("/S")
+        // `cmd.exe` does not understand the backslash quote escaping that
+        // Rust's normal Windows argument builder emits. The command text is
+        // assembled exclusively from fixed system paths and a validated
+        // generated helper path, so pass this one argument verbatim.
+        .raw_arg(format!("/C {command_line}"))
+        .creation_flags(0x08000000)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to start Windows cleanup of COPE helper {}: {error}",
+                canonical_path.display()
+            )
+        })
+}
+
+pub fn run_deferred_cleanup(parent_pid: u32) -> Result<()> {
+    let dir = verified_cope_dir()?;
+    wait_for_parent_exit(parent_pid)?;
+
+    remove_owned_data_files(&dir)?;
+    let installed_exe = dir.join("cope.exe");
+    if installed_exe.exists() {
+        fs::remove_file(&installed_exe).map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to remove installed COPE executable {}: {error}",
+                installed_exe.display()
+            )
+        })?;
+    }
+    let _ = remove_cope_dir_if_empty(&dir)?;
+
+    // The helper is itself a COPE executable. A detached Windows cleanup
+    // process removes it after this process exits.
+    schedule_helper_self_delete(&current_exe_path()?)?;
+    Ok(())
+}
+
 pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let paths_key =
@@ -84,17 +343,12 @@ pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
     let dir_str = dir.to_string_lossy().to_string();
     let dir_str_lower = dir_str.to_lowercase();
 
-    if current_path.to_lowercase().contains(&dir_str_lower) {
-        let mut new_path = String::new();
-        for part in current_path.split(';') {
-            let part_trimmed = part.trim();
-            if part_trimmed.to_lowercase() != dir_str_lower {
-                if !new_path.is_empty() {
-                    new_path.push(';');
-                }
-                new_path.push_str(part_trimmed);
-            }
-        }
+    let parts: Vec<&str> = current_path
+        .split(';')
+        .filter(|part| part.trim().to_lowercase() != dir_str_lower)
+        .collect();
+    if parts.len() != current_path.split(';').count() {
+        let new_path = parts.join(";");
         if new_path != current_path {
             paths_key.set_value("PATH", &new_path)?;
         }

@@ -20,6 +20,8 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+use winreg::RegKey;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -31,16 +33,19 @@ fn cope_exe() -> &'static str {
 
 struct TestEnv {
     temp_dir: TempDir,
+    capture_dir: TempDir,
     daemon_child: Option<Child>,
 }
 
 impl TestEnv {
     fn new() -> Self {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let capture_dir = TempDir::new().expect("failed to create output capture dir");
         std::env::set_var("COPE_TEST_DATA_DIR", temp_dir.path());
         std::env::set_var("COPE_TEST_DAEMON_MODE", "ready");
         Self {
             temp_dir,
+            capture_dir,
             daemon_child: None,
         }
     }
@@ -148,21 +153,56 @@ impl Drop for TestEnv {
 
 impl TestEnv {
     fn run_cope(&self, arg: &str) -> (Option<i32>, String, String) {
-        let stdout_path = self.temp_dir.path().join(format!("cope-{arg}-stdout.txt"));
-        let stderr_path = self.temp_dir.path().join(format!("cope-{arg}-stderr.txt"));
+        self.run_cope_from(PathBuf::from(cope_exe()).as_path(), arg, "")
+    }
+
+    fn run_cope_from(
+        &self,
+        exe: &std::path::Path,
+        arg: &str,
+        input: &str,
+    ) -> (Option<i32>, String, String) {
+        let stdout_path = self
+            .capture_dir
+            .path()
+            .join(format!("cope-{arg}-stdout.txt"));
+        let stderr_path = self
+            .capture_dir
+            .path()
+            .join(format!("cope-{arg}-stderr.txt"));
         let stdout_file =
             std::fs::File::create(&stdout_path).expect("failed to create stdout capture");
         let stderr_file =
             std::fs::File::create(&stderr_path).expect("failed to create stderr capture");
-        let mut child = Command::new(cope_exe())
+        let mut command = Command::new(exe);
+        command
             .arg(arg)
             .env("COPE_TEST_DATA_DIR", self.temp_dir.path())
             .env("COPE_TEST_DAEMON_MODE", "ready")
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(CREATE_NO_WINDOW);
+        if let Ok(value) = std::env::var("COPE_TEST_FAIL_UNINSTALL_SCHEDULE") {
+            command.env("COPE_TEST_FAIL_UNINSTALL_SCHEDULE", value);
+        }
+        let mut child = command
+            .stdin(if input.is_empty() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
             .spawn()
             .expect("failed to spawn cope.exe");
+
+        if !input.is_empty() {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin should be piped for interactive command")
+                .write_all(input.as_bytes())
+                .expect("failed to write command input");
+        }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -190,6 +230,102 @@ impl TestEnv {
             }
         }
     }
+}
+
+struct RegistrySnapshot {
+    startup: Option<String>,
+    user_path: Option<String>,
+}
+
+impl RegistrySnapshot {
+    fn capture() -> Self {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let startup_key = hkcu
+            .open_subkey_with_flags(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                KEY_READ,
+            )
+            .ok();
+        let environment_key = hkcu.open_subkey_with_flags("Environment", KEY_READ).ok();
+        Self {
+            startup: startup_key.and_then(|key| key.get_value("COPE").ok()),
+            user_path: environment_key.and_then(|key| key.get_value("PATH").ok()),
+        }
+    }
+
+    fn set_test_state(&self, env: &TestEnv) {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let run_key = hkcu
+            .open_subkey_with_flags(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                KEY_SET_VALUE,
+            )
+            .expect("Run registry key should exist");
+        run_key
+            .set_value(
+                "COPE",
+                &format!("\"{}\" daemon", env.installed_exe().display()),
+            )
+            .expect("failed to set test startup value");
+
+        let environment_key = hkcu
+            .open_subkey_with_flags("Environment", KEY_SET_VALUE)
+            .expect("Environment registry key should exist");
+        let existing_path: String = environment_key.get_value("PATH").unwrap_or_default();
+        environment_key
+            .set_value(
+                "PATH",
+                &format!(
+                    "{};{};C:\\Unrelated\\COPE-neighbor",
+                    existing_path,
+                    env.config_dir().display()
+                ),
+            )
+            .expect("failed to set test user PATH");
+    }
+}
+
+impl Drop for RegistrySnapshot {
+    fn drop(&mut self) {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(run_key) = hkcu.open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            KEY_SET_VALUE,
+        ) {
+            match &self.startup {
+                Some(value) => run_key.set_value("COPE", value).unwrap(),
+                None => {
+                    let _ = run_key.delete_value("COPE");
+                }
+            }
+        }
+        if let Ok(environment_key) = hkcu.open_subkey_with_flags("Environment", KEY_SET_VALUE) {
+            match &self.user_path {
+                Some(value) => environment_key.set_value("PATH", value).unwrap(),
+                None => {
+                    let _ = environment_key.delete_value("PATH");
+                }
+            }
+        }
+    }
+}
+
+fn wait_for_path_state(path: &std::path::Path, expected_exists: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while path.exists() != expected_exists && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        path.exists(),
+        expected_exists,
+        "timed out waiting for {} to {}",
+        path.display(),
+        if expected_exists {
+            "exist"
+        } else {
+            "be removed"
+        }
+    );
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -340,4 +476,123 @@ fn start_when_stopped_exits_zero_and_spawns() {
         !env.is_daemon_running(),
         "daemon should not be running after stop"
     );
+}
+
+#[test]
+fn uninstall_removes_startup_path_config_history_pid_and_installed_exe() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let env = TestEnv::new();
+    let registry = RegistrySnapshot::capture();
+    registry.set_test_state(&env);
+    env.ensure_installed_exe();
+    std::fs::write(env.config_dir().join("config.json"), "{}\n").unwrap();
+    std::fs::write(
+        env.config_dir().join("history.jsonl"),
+        "{\"ca\":\"test\",\"destination\":\"X Search\",\"timestamp\":\"now\"}\n",
+    )
+    .unwrap();
+    std::fs::write(env.pid_file(), "999999").unwrap();
+
+    let installed = env.installed_exe();
+    let (code, stdout, stderr) = env.run_cope_from(&installed, "uninstall", "y\n");
+    assert_eq!(
+        code,
+        Some(0),
+        "uninstall failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(strip_ansi(&stdout).contains("Remove COPE and its local data?"));
+
+    wait_for_path_state(&env.config_dir(), false);
+    assert!(
+        !env.installed_exe().exists(),
+        "installed cope.exe must be removed"
+    );
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let run_key = hkcu
+        .open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            KEY_READ,
+        )
+        .unwrap();
+    assert!(run_key.get_value::<String, _>("COPE").is_err());
+    let environment_key = hkcu
+        .open_subkey_with_flags("Environment", KEY_READ)
+        .unwrap();
+    let path: String = environment_key.get_value("PATH").unwrap_or_default();
+    assert!(!path.split(';').any(|entry| entry
+        .trim()
+        .eq_ignore_ascii_case(&env.config_dir().to_string_lossy())));
+    assert!(path.contains("C:\\Unrelated\\COPE-neighbor"));
+}
+
+#[test]
+fn uninstall_keeps_unrelated_sibling_files() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let env = TestEnv::new();
+    let registry = RegistrySnapshot::capture();
+    registry.set_test_state(&env);
+    env.ensure_installed_exe();
+    std::fs::write(env.config_dir().join("config.json"), "{}\n").unwrap();
+    std::fs::write(env.config_dir().join("history.jsonl"), "history\n").unwrap();
+    std::fs::write(env.pid_file(), "999999").unwrap();
+    let unrelated = env.config_dir().join("user-owned.txt");
+    std::fs::write(&unrelated, "keep me\n").unwrap();
+
+    let installed = env.installed_exe();
+    let (code, _, stderr) = env.run_cope_from(&installed, "uninstall", "y\n");
+    assert_eq!(code, Some(0), "uninstall failed: {stderr:?}");
+
+    wait_for_path_state(&env.config_dir(), true);
+    wait_for_path_state(&env.installed_exe(), false);
+    assert!(unrelated.exists(), "unrelated sibling must not be removed");
+    assert!(!env.config_dir().join("config.json").exists());
+    assert!(!env.config_dir().join("history.jsonl").exists());
+    assert!(!env.pid_file().exists());
+    assert!(!env.installed_exe().exists());
+}
+
+#[test]
+fn uninstall_reports_executable_removal_failure() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let env = TestEnv::new();
+    let registry = RegistrySnapshot::capture();
+    registry.set_test_state(&env);
+    env.ensure_installed_exe();
+    std::env::set_var("COPE_TEST_FAIL_UNINSTALL_SCHEDULE", "1");
+    let (code, stdout, stderr) =
+        env.run_cope_from(PathBuf::from(cope_exe()).as_path(), "uninstall", "y\n");
+    std::env::remove_var("COPE_TEST_FAIL_UNINSTALL_SCHEDULE");
+    assert_ne!(
+        code,
+        Some(0),
+        "unexpected uninstall success: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(!strip_ansi(&stdout).contains("COPE uninstalled."));
+    assert!(
+        !stderr.trim().is_empty(),
+        "failure to remove installed executable must be reported"
+    );
+}
+
+#[test]
+fn uninstall_stops_running_daemon_and_removes_pid() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut env = TestEnv::new();
+    let registry = RegistrySnapshot::capture();
+    registry.set_test_state(&env);
+    env.ensure_installed_exe();
+    let daemon_pid = env.start_daemon();
+    assert!(env.pid_alive(daemon_pid));
+
+    let installed = env.installed_exe();
+    let (code, _, stderr) = env.run_cope_from(&installed, "uninstall", "y\n");
+    assert_eq!(code, Some(0), "uninstall failed: {stderr:?}");
+    wait_for_path_state(&env.config_dir(), false);
+    assert!(!env.pid_alive(daemon_pid), "uninstall must stop the daemon");
+    assert!(!env.pid_file().exists(), "uninstall must remove daemon.pid");
 }
