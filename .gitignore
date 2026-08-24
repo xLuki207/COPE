@@ -11,8 +11,14 @@ vs_BuildTools.exe
 # Local test artifacts
 /temp-logs/
 
-# Release artifacts (ignored in repo)
-/dist/
+# Acceptance scripts and local output
+acceptance.ps1
+browser_acceptance.ps1
+*.profraw
+*.profdata
+cope-preview.exe
+temp_*.log
+temp_*.txt
 
 # COPE data directory (per-user, not committed)
 # %LOCALAPPDATA%\COPE\ contents are not committed
@@ -24,10 +30,3 @@ vs_BuildTools.exe
 # Backup files
 *.rs.bak
 *.rs.orig
-# Local build/test artifacts
-cope-preview.exe
-temp_*.log
-temp_*.txt
-*.pdb
-/target/
-/dist/

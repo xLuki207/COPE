@@ -11,7 +11,7 @@ Security fixes apply to the latest release only.
 If you believe you have found a security issue in COPE, please report it
 privately by opening a GitHub Security Advisory at:
 
-https://github.com/anomalyco/cope/security/advisories/new
+https://github.com/xLuki207/COPE/security/advisories/new
 
 Please include:
 
@@ -70,7 +70,7 @@ The release binary is built from source using:
 - `cargo clippy --all-targets --all-features -- -D warnings` passes
 - All 39 unit tests and 4 lifecycle tests pass
 
-SHA256 of the release binary is published in `dist/SHA256SUMS.txt`.
+Release binary checksums are published with the GitHub release.
 
 ## Limitations
 

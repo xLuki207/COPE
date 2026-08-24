@@ -71,8 +71,7 @@ impl Config {
                 changed = true;
             }
         }
-        // Alt+R was the v0.1.0 pre-release default, but is reserved on some
-        // Windows sessions. Migrate that old default to the released Alt+Q.
+        // Migrate the old RugCheck default to the released shortcut.
         if let Some(route) = self.routes.get_mut(Destination::RugCheck) {
             if route.modifiers == 0x0001 && route.vk_code == 0x52 {
                 *route = RouteConfig::default_for(Destination::RugCheck);

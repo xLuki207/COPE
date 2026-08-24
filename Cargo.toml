@@ -2,7 +2,7 @@
 name = "cope"
 version = "0.1.0"
 edition = "2021"
-description = "Tiny local utility for Solana memecoin traders - instant CA routing via hotkeys"
+description = "Local Windows utility for routing Solana contract addresses via hotkeys"
 license = "MIT"
 
 [dependencies]

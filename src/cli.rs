@@ -13,8 +13,8 @@ use winreg::enums::KEY_READ;
 use winreg::enums::KEY_WRITE;
 use winreg::RegKey;
 
-const COPE_TAGLINE: &str = "route any CA. instantly.";
-const COPE_MEMECOIN_TAGLINE: &str = "built for the Solana trenches.";
+const COPE_TAGLINE: &str = "route Solana CAs with hotkeys.";
+const COPE_MEMECOIN_TAGLINE: &str = "built for Solana traders.";
 
 const C: &str = "\x1b[38;2;0;200;255m";
 const G: &str = "\x1b[32m";
@@ -76,8 +76,8 @@ impl Cli {
 
     pub fn help() -> String {
         "COPE
-route any CA. instantly.
-built for the Solana trenches.
+route Solana CAs with hotkeys.
+built for Solana traders.
 
 Usage:
   cope <COMMAND>
