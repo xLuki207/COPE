@@ -294,7 +294,7 @@ fn schedule_helper_self_delete(path: &std::path::Path) -> Result<()> {
         // Rust's normal Windows argument builder emits. The command text is
         // assembled exclusively from fixed system paths and a validated
         // generated helper path, so pass this one argument verbatim.
-        .raw_arg(format!("/C {command_line}"))
+        .raw_arg(format!("/C \"{command_line}\""))
         .creation_flags(0x08000000)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
