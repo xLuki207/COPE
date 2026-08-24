@@ -254,7 +254,8 @@ fn schedule_helper_self_delete(path: &std::path::Path) -> Result<()> {
     }
 
     let path_string = canonical_path.to_string_lossy();
-    if !path_string.chars().all(|character| {
+    let command_path = path_string.strip_prefix(r"\\?\").unwrap_or(&path_string);
+    if !command_path.chars().all(|character| {
         character.is_ascii_alphanumeric()
             || matches!(character, ':' | '\\' | '/' | '_' | '-' | '.' | ' ' | '~')
     }) {
@@ -281,20 +282,18 @@ fn schedule_helper_self_delete(path: &std::path::Path) -> Result<()> {
     let cleanup_attempt = format!(
         "\"{}\" 127.0.0.1 -n 2 > nul & del /f /q \"{}\"",
         ping.display(),
-        canonical_path.display()
+        command_path
     );
     let command_line = (0..5)
         .map(|_| cleanup_attempt.as_str())
         .collect::<Vec<_>>()
         .join(" & ");
     Command::new(&cmd)
-        .arg("/D")
-        .arg("/S")
         // `cmd.exe` does not understand the backslash quote escaping that
         // Rust's normal Windows argument builder emits. The command text is
         // assembled exclusively from fixed system paths and a validated
         // generated helper path, so pass this one argument verbatim.
-        .raw_arg(format!("/C \"{command_line}\""))
+        .raw_arg(format!("/D /S /C \"{command_line}\""))
         .creation_flags(0x08000000)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -694,6 +693,30 @@ mod tests {
         assert_eq!(
             startup_command(path),
             r#""C:\Users\John Doe\AppData\Local\COPE\cope.exe" daemon"#
+        );
+    }
+
+    #[test]
+    fn test_cleanup_helper_launcher_removes_validated_temp_file() {
+        let path = std::env::temp_dir().join(format!(
+            "cope-uninstall-test-{}-{}.exe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"test").unwrap();
+        schedule_helper_self_delete(&path).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !path.exists(),
+            "cleanup launcher did not remove helper file"
         );
     }
 
