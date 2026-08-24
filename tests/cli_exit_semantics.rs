@@ -20,7 +20,7 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 use winreg::RegKey;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -43,6 +43,17 @@ impl TestEnv {
         let capture_dir = TempDir::new().expect("failed to create output capture dir");
         std::env::set_var("COPE_TEST_DATA_DIR", temp_dir.path());
         std::env::set_var("COPE_TEST_DAEMON_MODE", "ready");
+        std::env::set_var(
+            "COPE_TEST_REGISTRY_ROOT",
+            format!(
+                "Software\\COPE\\Tests\\{}\\{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock should be after epoch")
+                    .as_nanos()
+            ),
+        );
         Self {
             temp_dir,
             capture_dir,
@@ -101,6 +112,10 @@ impl TestEnv {
             .arg("daemon")
             .env("COPE_TEST_DATA_DIR", self.temp_dir.path())
             .env("COPE_TEST_DAEMON_MODE", "ready")
+            .env(
+                "COPE_TEST_REGISTRY_ROOT",
+                std::env::var("COPE_TEST_REGISTRY_ROOT").unwrap(),
+            )
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -179,6 +194,10 @@ impl TestEnv {
             .arg(arg)
             .env("COPE_TEST_DATA_DIR", self.temp_dir.path())
             .env("COPE_TEST_DAEMON_MODE", "ready")
+            .env(
+                "COPE_TEST_REGISTRY_ROOT",
+                std::env::var("COPE_TEST_REGISTRY_ROOT").unwrap(),
+            )
             .creation_flags(CREATE_NO_WINDOW);
         if let Ok(value) = std::env::var("COPE_TEST_FAIL_UNINSTALL_SCHEDULE") {
             command.env("COPE_TEST_FAIL_UNINSTALL_SCHEDULE", value);
@@ -233,34 +252,28 @@ impl TestEnv {
 }
 
 struct RegistrySnapshot {
-    startup: Option<String>,
-    user_path: Option<String>,
+    root_path: String,
 }
 
 impl RegistrySnapshot {
     fn capture() -> Self {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let startup_key = hkcu
-            .open_subkey_with_flags(
-                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                KEY_READ,
-            )
-            .ok();
-        let environment_key = hkcu.open_subkey_with_flags("Environment", KEY_READ).ok();
         Self {
-            startup: startup_key.and_then(|key| key.get_value("COPE").ok()),
-            user_path: environment_key.and_then(|key| key.get_value("PATH").ok()),
+            root_path: std::env::var("COPE_TEST_REGISTRY_ROOT").unwrap(),
         }
     }
 
     fn set_test_state(&self, env: &TestEnv) {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let run_key = hkcu
-            .open_subkey_with_flags(
-                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                KEY_SET_VALUE,
-            )
-            .expect("Run registry key should exist");
+        let test_root = hkcu
+            .open_subkey_with_flags(&self.root_path, KEY_READ)
+            .unwrap_or_else(|_| {
+                hkcu.create_subkey(&self.root_path)
+                    .expect("failed to create isolated test registry root")
+                    .0
+            });
+        let (run_key, _) = test_root
+            .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+            .expect("failed to create isolated Run registry key");
         run_key
             .set_value(
                 "COPE",
@@ -268,9 +281,9 @@ impl RegistrySnapshot {
             )
             .expect("failed to set test startup value");
 
-        let environment_key = hkcu
-            .open_subkey_with_flags("Environment", KEY_SET_VALUE)
-            .expect("Environment registry key should exist");
+        let (environment_key, _) = test_root
+            .create_subkey("Environment")
+            .expect("failed to create isolated Environment registry key");
         let existing_path: String = environment_key.get_value("PATH").unwrap_or_default();
         environment_key
             .set_value(
@@ -281,33 +294,21 @@ impl RegistrySnapshot {
                     env.config_dir().display()
                 ),
             )
-            .expect("failed to set test user PATH");
+            .expect("failed to set isolated test PATH");
     }
 }
 
 impl Drop for RegistrySnapshot {
     fn drop(&mut self) {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(run_key) = hkcu.open_subkey_with_flags(
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            KEY_SET_VALUE,
-        ) {
-            match &self.startup {
-                Some(value) => run_key.set_value("COPE", value).unwrap(),
-                None => {
-                    let _ = run_key.delete_value("COPE");
-                }
-            }
-        }
-        if let Ok(environment_key) = hkcu.open_subkey_with_flags("Environment", KEY_SET_VALUE) {
-            match &self.user_path {
-                Some(value) => environment_key.set_value("PATH", value).unwrap(),
-                None => {
-                    let _ = environment_key.delete_value("PATH");
-                }
-            }
-        }
+        let _ = hkcu.delete_subkey_all(&self.root_path);
     }
+}
+
+fn isolated_registry_root() -> RegKey {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(std::env::var("COPE_TEST_REGISTRY_ROOT").unwrap(), KEY_READ)
+        .expect("isolated test registry root should exist")
 }
 
 fn wait_for_path_state(path: &std::path::Path, expected_exists: bool) {
@@ -509,17 +510,17 @@ fn uninstall_removes_startup_path_config_history_pid_and_installed_exe() {
         "installed cope.exe must be removed"
     );
 
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let run_key = hkcu
+    let test_root = isolated_registry_root();
+    let run_key = test_root
         .open_subkey_with_flags(
             "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
             KEY_READ,
         )
-        .unwrap();
+        .expect("isolated Run key should exist during assertion");
     assert!(run_key.get_value::<String, _>("COPE").is_err());
-    let environment_key = hkcu
+    let environment_key = test_root
         .open_subkey_with_flags("Environment", KEY_READ)
-        .unwrap();
+        .expect("isolated Environment key should exist during assertion");
     let path: String = environment_key.get_value("PATH").unwrap_or_default();
     assert!(!path.split(';').any(|entry| entry
         .trim()

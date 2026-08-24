@@ -13,6 +13,7 @@ use winreg::RegKey;
 const APP_NAME: &str = "COPE";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const GLOBAL_MUTEX_NAME: &str = "Global\\COPE_SINGLE_INSTANCE_MUTEX";
+const TEST_REGISTRY_ROOT_ENV: &str = "COPE_TEST_REGISTRY_ROOT";
 
 fn global_mutex_name() -> String {
     if let Ok(test_dir) = std::env::var("COPE_TEST_DATA_DIR") {
@@ -32,30 +33,53 @@ pub fn startup_command(exe_path: &std::path::Path) -> String {
     format!("\"{}\" daemon", exe_path.display())
 }
 
+/// Use an isolated HKCU namespace for deterministic integration tests. Normal
+/// COPE operation always returns the real current-user registry root.
+pub fn registry_root() -> Result<RegKey> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(test_root) = std::env::var(TEST_REGISTRY_ROOT_ENV) {
+        let (root, _) = hkcu.create_subkey(test_root)?;
+        Ok(root)
+    } else {
+        Ok(hkcu)
+    }
+}
+
 pub fn enable_startup() -> Result<()> {
     let exe_path = installed_exe_path()?;
     let cmd = startup_command(&exe_path);
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let run_key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
+    let root = registry_root()?;
+    let (run_key, _) = root.create_subkey(RUN_KEY)?;
     run_key.set_value(APP_NAME, &cmd)?;
     Ok(())
 }
 
 pub fn disable_startup() -> Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(run_key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) else {
-        return Ok(());
+    let root = registry_root()?;
+    let run_key = match root.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
-    let _ = run_key.delete_value(APP_NAME);
+    match run_key.delete_value(APP_NAME) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
 pub fn is_startup_enabled() -> Result<bool> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let run_key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ)?;
+    let root = registry_root()?;
+    let run_key = match root.open_subkey_with_flags(RUN_KEY, KEY_READ) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     let value: String = match run_key.get_value(APP_NAME) {
         Ok(v) => v,
-        Err(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
     Ok(value.trim_end().ends_with("daemon"))
 }
@@ -331,9 +355,14 @@ pub fn run_deferred_cleanup(parent_pid: u32) -> Result<()> {
 }
 
 pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let paths_key =
-        hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE | KEY_CREATE_SUB_KEY)?;
+    let root = registry_root()?;
+    let paths_key = match root
+        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE | KEY_CREATE_SUB_KEY)
+    {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
 
     let current_path = paths_key
         .get_value::<String, _>("PATH")

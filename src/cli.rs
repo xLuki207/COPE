@@ -9,10 +9,6 @@ use crate::windows::{
 use anyhow::Result;
 use std::io::{self, Write};
 use std::sync::Arc;
-use winreg::enums::KEY_CREATE_SUB_KEY;
-use winreg::enums::KEY_READ;
-use winreg::enums::KEY_WRITE;
-use winreg::RegKey;
 
 const COPE_TAGLINE: &str = "route Solana CAs with hotkeys.";
 const COPE_MEMECOIN_TAGLINE: &str = "built for Solana traders.";
@@ -158,20 +154,17 @@ fn cmd_install() -> Result<()> {
     std::fs::copy(&current_exe, &installed_exe)?;
 
     let cope_dir_str = cope_dir.to_string_lossy().to_string();
-    let hkcu = RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    if let Ok(paths_key) =
-        hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE | KEY_CREATE_SUB_KEY)
-    {
-        let current_path = paths_key
-            .get_value::<String, _>("PATH")
-            .unwrap_or_else(|_| String::new());
-        let dir_lower = cope_dir_str.to_lowercase();
-        let already_present = current_path
-            .split(';')
-            .any(|e| e.trim().to_lowercase() == dir_lower);
-        if !already_present {
-            paths_key.set_value("PATH", &format!("{};{}", current_path, cope_dir_str))?;
-        }
+    let root = crate::windows::registry_root()?;
+    let (paths_key, _) = root.create_subkey("Environment")?;
+    let current_path = paths_key
+        .get_value::<String, _>("PATH")
+        .unwrap_or_else(|_| String::new());
+    let dir_lower = cope_dir_str.to_lowercase();
+    let already_present = current_path
+        .split(';')
+        .any(|e| e.trim().to_lowercase() == dir_lower);
+    if !already_present {
+        paths_key.set_value("PATH", &format!("{};{}", current_path, cope_dir_str))?;
     }
 
     if start_with_windows {
