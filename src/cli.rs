@@ -1,4 +1,5 @@
 use crate::config::{config_dir, Config};
+use crate::history::History;
 use crate::routes::Destination;
 use crate::windows::{
     disable_startup, enable_startup, installed_cope_dir, is_daemon_running, is_startup_enabled,
@@ -15,35 +16,43 @@ use winreg::RegKey;
 const COPE_TAGLINE: &str = "route any CA. instantly.";
 const COPE_MEMECOIN_TAGLINE: &str = "built for the Solana trenches.";
 
-// Manual CLI enum - no clap Subcommand derive to avoid conflicts
+const C: &str = "\x1b[38;2;0;200;255m";
+const G: &str = "\x1b[32m";
+const R: &str = "\x1b[31m";
+const Y: &str = "\x1b[33m";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+
 #[derive(Clone, Debug)]
 pub enum Commands {
-    /// Install and start COPE
     Install,
-    /// Start COPE in background
     Start,
-    /// Stop background COPE process
     Stop,
-    /// Show current status
     Status,
-    /// Remove COPE from startup and delete config
     Uninstall,
-    /// Run as background daemon (internal)
+    History { all: bool, clear: bool },
     Daemon,
-    /// Print help information
     Help,
+    Version,
 }
 
 impl Commands {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "install" => Some(Commands::Install),
-            "start" => Some(Commands::Start),
-            "stop" => Some(Commands::Stop),
-            "status" => Some(Commands::Status),
-            "uninstall" => Some(Commands::Uninstall),
-            "help" => Some(Commands::Help),
-            "daemon" => Some(Commands::Daemon),
+    pub fn from_str(args: &[String]) -> Option<Self> {
+        match args.first().map(|s| s.as_str()) {
+            Some("install") => Some(Commands::Install),
+            Some("start") => Some(Commands::Start),
+            Some("stop") => Some(Commands::Stop),
+            Some("status") => Some(Commands::Status),
+            Some("uninstall") => Some(Commands::Uninstall),
+            Some("history") => {
+                let all = args.iter().any(|a| a == "--all");
+                let clear = args.get(1).map(|s| s.as_str()) == Some("clear");
+                Some(Commands::History { all, clear })
+            }
+            Some("help") => Some(Commands::Help),
+            Some("daemon") => Some(Commands::Daemon),
+            Some("--version") | Some("-v") => Some(Commands::Version),
+            Some("--help") | Some("-h") => Some(Commands::Help),
             _ => None,
         }
     }
@@ -60,7 +69,7 @@ impl Cli {
             println!("{}", Self::help());
             std::process::exit(0);
         } else {
-            Commands::from_str(&args[0]).unwrap_or(Commands::Status)
+            Commands::from_str(&args).unwrap_or(Commands::Status)
         };
         Self { command }
     }
@@ -78,15 +87,19 @@ Commands:
   start        Start COPE
   stop         Stop COPE
   status       Show COPE status
+  history      Show recent route history
   uninstall    Remove COPE
 
 Hotkeys:
+  Alt+A        Axiom
   Alt+G        GMGN
   Alt+X        X Search
   Alt+D        DexScreener
   Alt+P        Pump.fun
   Alt+F        FOMO
   Alt+S        Solscan
+  Alt+Q        RugCheck
+  Alt+B        Bundle Checker (Trench Radar clusters)
 
 Run 'cope help' for more information."
             .to_string()
@@ -100,8 +113,8 @@ pub fn execute(cli: Cli) -> Result<()> {
         Commands::Status => cmd_status(),
         Commands::Uninstall => cmd_uninstall(),
         Commands::Install => cmd_install(),
-        Commands::Help => Ok(()),
-        Commands::Daemon => Ok(()),
+        Commands::History { all, clear } => cmd_history(all, clear),
+        Commands::Help | Commands::Daemon | Commands::Version => Ok(()),
     }
 }
 
@@ -120,6 +133,18 @@ fn cmd_install() -> Result<()> {
 
     let cope_dir = installed_cope_dir()?;
     let installed_exe = cope_dir.join("cope.exe");
+
+    if is_daemon_running()? {
+        println!("{Y}COPE daemon is already running. Stopping it first...{RESET}");
+        match stop_daemon() {
+            Ok(true) => println!("{G}Existing daemon stopped.{RESET}"),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("{R}Cannot stop existing COPE daemon: {e}{RESET}");
+                anyhow::bail!("Failed to stop existing daemon");
+            }
+        }
+    }
 
     std::fs::create_dir_all(&cope_dir)?;
     std::fs::copy(&current_exe, &installed_exe)?;
@@ -143,7 +168,7 @@ fn cmd_install() -> Result<()> {
 
     if start_with_windows {
         enable_startup()?;
-        println!("Added to Windows startup.");
+        println!("{G}Added to Windows startup.{RESET}");
     }
 
     let failed = {
@@ -163,9 +188,9 @@ fn cmd_install() -> Result<()> {
         let _ = remove_from_user_path(&cope_dir);
         let _ = std::fs::remove_file(&installed_exe);
         let _ = std::fs::remove_dir_all(&cope_dir);
-        eprintln!("COPE could not start.");
+        eprintln!("{R}COPE could not start.{RESET}");
         for msg in failed {
-            eprintln!("{}", msg);
+            eprintln!("{Y}{msg}{RESET}");
         }
         anyhow::bail!("Hotkey registration failed");
     }
@@ -177,29 +202,33 @@ fn cmd_install() -> Result<()> {
 
     start_background(Some(installed_exe))?;
 
-    println!("\nReady.");
-    println!("COPE is running in the background.");
+    println!();
+    println!("{G}Ready.{RESET}");
+    println!("{G}COPE is running in the background.{RESET}");
 
     Ok(())
 }
 
 fn cmd_start() -> Result<()> {
-    if is_daemon_running()? {
-        println!("COPE is already running.");
-        return Ok(());
+    // "Already running" is an expected idempotent state, not a failure:
+    // start_background returns Ok(false) in that case.
+    let started = start_background(None)?;
+    if started {
+        println!("{G}COPE started.{RESET}");
+    } else {
+        println!("{Y}COPE is already running.{RESET}");
     }
-
-    let _config = Config::load().unwrap_or_default();
-    start_background(None)?;
-    println!("COPE started.");
     Ok(())
 }
 
 fn cmd_stop() -> Result<()> {
-    if stop_daemon()? {
-        println!("COPE stopped.");
-    } else {
-        println!("COPE is not running.");
+    match stop_daemon() {
+        Ok(true) => println!("{R}COPE stopped.{RESET}"),
+        Ok(false) => println!("{DIM}COPE is not running.{RESET}"),
+        Err(e) => {
+            println!("{R}Failed to stop COPE: {e}{RESET}");
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -207,17 +236,43 @@ fn cmd_stop() -> Result<()> {
 fn cmd_status() -> Result<()> {
     let running = is_daemon_running()?;
     let startup = is_startup_enabled()?;
-    let config = Config::load().unwrap_or_default();
+    let mut config = Config::load().unwrap_or_default();
+    config.ensure_default_routes();
 
-    println!("COPE Status");
-    println!("===========");
-    println!("Running:     {}", if running { "Yes" } else { "No" });
-    println!(
-        "Startup:     {}",
-        if startup { "Enabled" } else { "Disabled" }
-    );
-    println!("Config dir:  {}", config_dir()?.display());
-    print_routes_table_with_status(&config);
+    println!("{C}COPE STATUS{RESET}");
+    println!();
+    let running_color = if running { G } else { R };
+    let running_val = if running { "Yes" } else { "No" };
+    println!("  {DIM}Running{RESET}    {running_color}{running_val}{RESET}");
+    let startup_val = if startup { "Enabled" } else { "Disabled" };
+    println!("  {DIM}Startup{RESET}    {C}{startup_val}{RESET}");
+    println!("  {DIM}Installed{RESET}  {G}Yes{RESET}");
+    if let Ok(dir) = config_dir() {
+        println!("  {DIM}Data dir{RESET}  {DIM}{}{RESET}", dir.display());
+    }
+
+    println!();
+    println!("{C}  {:<14} {:<10} Status{RESET}", "Destination", "Hotkey");
+    println!("  {}", "-".repeat(38));
+
+    for dest in Destination::all() {
+        let route = match config.get_route(*dest) {
+            Some(r) => r,
+            None => continue,
+        };
+        let status = if route.enabled {
+            format!("{G}enabled{RESET}")
+        } else {
+            format!("{DIM}disabled{RESET}")
+        };
+        println!(
+            "  {:<14} {:<10} {}",
+            dest.display_name(),
+            route.hotkey_string(),
+            status
+        );
+    }
+
     Ok(())
 }
 
@@ -231,34 +286,94 @@ fn cmd_uninstall() -> Result<()> {
         return Ok(());
     }
 
-    let _ = stop_daemon();
+    if let Err(e) = stop_daemon() {
+        eprintln!("{R}Cannot stop COPE daemon: {e}{RESET}");
+        anyhow::bail!("Failed to stop existing daemon");
+    }
     let _ = disable_startup();
 
     let cope_dir = installed_cope_dir()?;
     remove_from_user_path(&cope_dir)?;
 
+    // Remove all COPE-owned local state: exe, config, history, PID file.
+    // Everything lives under %LOCALAPPDATA%\COPE.
     if cope_dir.exists() {
         let _ = std::fs::remove_dir_all(&cope_dir);
     }
 
-    let config_path = Config::config_path()?;
-    if config_path.exists() {
-        let _ = std::fs::remove_file(&config_path);
+    println!("{R}COPE uninstalled.{RESET}");
+    Ok(())
+}
+
+fn cmd_history(all: bool, clear: bool) -> Result<()> {
+    let history = History::new()?;
+
+    if clear {
+        history.clear()?;
+        println!("{G}History cleared.{RESET}");
+        return Ok(());
     }
 
-    println!("COPE uninstalled.");
+    println!("{C}COPE HISTORY{RESET}");
+    println!();
+
+    let entries = if all {
+        history.read_all()?
+    } else {
+        history.read_latest()?
+    };
+
+    if entries.is_empty() {
+        println!("  No route history yet.");
+        return Ok(());
+    }
+
+    println!("  {DIM}#   {:<52} DATE / TIME{RESET}", "CONTRACT ADDRESS");
+    println!("  {}", "-".repeat(72));
+
+    for (i, entry) in entries.iter().enumerate() {
+        let ca_display = if entry.ca.len() > 48 {
+            let end_prefix = entry
+                .ca
+                .char_indices()
+                .nth(24)
+                .map_or(entry.ca.len(), |(i, _)| i);
+            let start_suffix = entry.ca.len() - 20;
+            let start_suffix = entry
+                .ca
+                .char_indices()
+                .nth(start_suffix)
+                .map_or(entry.ca.len(), |(i, _)| i);
+            format!(
+                "{}...{}",
+                &entry.ca[..end_prefix],
+                &entry.ca[start_suffix..]
+            )
+        } else {
+            entry.ca.clone()
+        };
+        println!(
+            "  {DIM}{:<4}{RESET} {:<52} {DIM}{}{RESET}",
+            i + 1,
+            ca_display,
+            entry.timestamp
+        );
+    }
+
+    if !all && entries.len() >= 25 {
+        println!("\n  Showing latest 25. Use 'cope history --all' for more.");
+    }
+
     Ok(())
 }
 
 fn print_branding() {
-    let c = "\x1b[38;2;0;200;255m";
-    let r = "\x1b[0m";
-    println!("{}   ██████╗ ██████╗ ██████╗ ███████╗{}", c, r);
-    println!("{}  ██╔════╝██╔═══██╗██╔══██╗██╔════╝{}", c, r);
-    println!("{}  ██║     ██║   ██║██████╔╝█████╗{}", c, r);
-    println!("{}  ██║     ██║   ██║██╔═══╝ ██╔══╝{}", c, r);
-    println!("{}  ╚██████╗╚██████╔╝██║     ███████╗{}", c, r);
-    println!("{}   ╚═════╝ ╚═════╝ ╚═╝     ╚══════╝{}", c, r);
+    println!("{}   ██████╗ ██████╗ ██████╗ ███████╗{}", C, RESET);
+    println!("{}  ██╔════╝██╔═══██╗██╔══██╗██╔════╝{}", C, RESET);
+    println!("{}  ██║     ██║   ██║██████╔╝█████╗{}", C, RESET);
+    println!("{}  ██║     ██║   ██║██╔═══╝ ██╔══╝{}", C, RESET);
+    println!("{}  ╚██████╗╚██████╔╝██║     ███████╗{}", C, RESET);
+    println!("{}   ╚═════╝ ╚═════╝ ╚═╝     ╚══════╝{}", C, RESET);
     println!("{}", COPE_TAGLINE);
     println!("{}", COPE_MEMECOIN_TAGLINE);
     println!();
@@ -266,26 +381,13 @@ fn print_branding() {
 
 fn print_routes_table() {
     println!("ROUTES\n");
+    println!("{:<8} Axiom", "Alt+A");
     println!("{:<8} GMGN", "Alt+G");
     println!("{:<8} X Search", "Alt+X");
     println!("{:<8} DexScreener", "Alt+D");
     println!("{:<8} Pump.fun", "Alt+P");
     println!("{:<8} FOMO", "Alt+F");
     println!("{:<8} Solscan", "Alt+S");
-}
-
-fn print_routes_table_with_status(config: &Config) {
-    println!("{:<14} {:<10} Status", "Destination", "Hotkey");
-    println!("{}", "-".repeat(40));
-
-    for dest in Destination::all() {
-        let route = config.get_route(*dest).unwrap();
-        let status = if route.enabled { "enabled" } else { "disabled" };
-        println!(
-            "{:<14} {:<10} {}",
-            dest.display_name(),
-            route.hotkey_string(),
-            status
-        );
-    }
+    println!("{:<8} RugCheck", "Alt+Q");
+    println!("{:<8} Bundle Checker (Trench Radar)", "Alt+B");
 }

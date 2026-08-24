@@ -1,58 +1,80 @@
 # COPE Security Model
 
-COPE is a local-only Windows utility for routing Solana memecoin contract addresses (CAs) to destination websites. This document describes the trust model and what COPE does and does not do.
+COPE v0.1.0 — local-only Windows utility for routing Solana contract addresses.
 
-## What COPE Does
+## Supported version
 
-- **Locally extracts Solana addresses** - COPE checks clipboard text or user selection for plausible Solana contract addresses (32-44 character base58 strings). This extraction happens entirely on the client.
+Security fixes apply to the latest release only.
 
-- **Opens URLs in default browser** - When a CA is identified, COPE constructs a URL and opens it in your Windows default browser. No on-chain verification is performed.
+## Vulnerability reporting
 
-- **Global hotkey handling** - COPE only attempts text capture when a configured global hotkey (Alt+G/X/D/P/F/S) is pressed. It does not continuously monitor the clipboard or keyboard.
+If you believe you have found a security issue in COPE, please report it
+privately by opening a GitHub Security Advisory at:
 
-- **Per-user installation** - COPE installs to `%LOCALAPPDATA%\COPE\` and modifies only the current user's PATH and startup registry. No administrator permissions are required.
+https://github.com/anomalyco/cope/security/advisories/new
 
-- **No account system** - COPE does not require or store any user accounts.
-
-- **No telemetry or analytics** - COPE does not send any user data, usage statistics, or crash reports to any server.
-
-- **No wallet integration** - COPE does not connect to, read, or interact with any cryptocurrency wallet.
-
-- **No browser cookie access** - COPE does not read browser cookies, local storage, or session data.
-
-- **No keylogging** - COPE does not record or monitor ordinary keyboard input except for the specific hotkey press detection.
-
-## What COPE Does NOT Do
-
-- **Does not access wallets** - COPE never reads seed phrases, private keys, or wallet files.
-
-- **Does not request seed phrases or private keys** - The UI contains no fields for seed phrases or private keys.
-
-- **Does not read browser cookies** - COPE has no access to browser data.
-
-- **Does not continuously monitor clipboard** - COPE only reads the clipboard when a COPE hotkey is actively pressed. The clipboard is snapshot before and after Ctrl+C synthesis, then restored immediately.
-
-- **Does not maintain clipboard history** - COPE restores the user's clipboard to its state before COPE's operation immediately after capture.
-
-- **Does not contain telemetry/analytics** - There is no remote data collection of any kind.
-
-- **Does not require an account** - COPE can be installed and used immediately without account creation.
-
-- **Does not send user data to a COPE server** - All processing is local. The only network action is opening a URL in the default browser.
-
-- **Does not verify on-chain memecoin status** - COPE locally extracts plausible Solana addresses from text. It does not query any API to verify whether a token is a legitimate memecoin or is supported by any destination.
-
-## Vulnerability Reporting
-
-If you believe you have found a security issue in COPE, please report it by opening an issue in the GitHub repository. Please include:
+Please include:
 
 - A clear description of the issue
 - Steps to reproduce
 - Your Windows version and COPE version
 - Any relevant error messages or output
 
-We will investigate all reports and respond appropriately.
+We will investigate all reports and respond appropriately. Please do not
+disclose vulnerabilities publicly until a fix is available.
 
-## Trust Summary
+## What COPE does
 
-COPE is designed with privacy as the default. It processes text locally, does not require network access beyond opening URLs, and contains no hidden data collection. All COPE operations are triggered explicitly by the user via global hotkeys.
+- Registers nine global hotkeys (Alt+A/G/X/D/P/F/S/Q/B) via the Windows API
+- On hotkey press: snapshots clipboard, injects Ctrl+C, reads selected text
+- Extracts valid Solana addresses (Base58, 32-byte decode) from selected text
+- Constructs a fixed HTTPS URL and opens it in the default browser
+- Restores the previous clipboard
+- Optionally stores local route history (CA + destination + timestamp)
+- The Bundle Checker route opens Trench Radar's token-specific clusters page;
+  COPE does not analyze the token itself
+
+## What COPE does not do
+
+- **No wallet access** — COPE never reads seed phrases, private keys, or wallet files
+- **No backend** — COPE has no server, no cloud, no API calls
+- **No telemetry** — No data is sent to any COPE server
+- **No analytics** — No usage tracking or monitoring
+- **No continuous clipboard monitoring** — Clipboard is accessed only when a COPE hotkey is pressed
+- **No clipboard persistence** — Clipboard content is never written to disk
+- **No keylogging** — Ordinary keyboard input is not captured
+- **No arbitrary command execution** — Selected text is parsed, never executed
+- **No browser automation** — COPE asks Windows to open a URL; the browser handles the rest
+- **No transaction signing** — COPE cannot initiate trades or transfers
+- **No account system** — No registration or login required
+
+## Threat model
+
+COPE is designed for single-user desktop use on Windows. An attacker who can:
+
+- Write to `%LOCALAPPDATA%\COPE\` could replace the COPE binary
+- Modify the Windows registry `HKCU\...\Run` key could alter startup behavior
+- Control the clipboard at the exact moment of a hotkey press could influence URL destination (limited by Base58 validation)
+
+These are standard desktop trust assumptions. COPE does not elevate privileges.
+Destination analysis is informational; COPE does not guarantee a token is safe,
+unruggable, or free of bundled supply.
+
+## Build provenance
+
+The release binary is built from source using:
+
+- `cargo build --locked --release`
+- `Cargo.lock` is committed
+- `cargo audit` reports zero advisories
+- `cargo clippy --all-targets --all-features -- -D warnings` passes
+- All 39 unit tests and 4 lifecycle tests pass
+
+SHA256 of the release binary is published in `dist/SHA256SUMS.txt`.
+
+## Limitations
+
+- COPE validates Solana addresses locally but does not verify on-chain status
+- The "sticky CA" feature reuses the last valid address when no new selection is detected
+- History is stored in plaintext JSONL in the config directory
+- Configuration, history, and PID state are stored under `%LOCALAPPDATA%\\COPE\\`

@@ -4,11 +4,28 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+use windows::Win32::System::Threading::CreateMutexW;
 use winreg::enums::*;
 use winreg::RegKey;
 
 const APP_NAME: &str = "COPE";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const GLOBAL_MUTEX_NAME: &str = "Global\\COPE_SINGLE_INSTANCE_MUTEX";
+
+fn global_mutex_name() -> String {
+    if let Ok(test_dir) = std::env::var("COPE_TEST_DATA_DIR") {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        test_dir.hash(&mut hasher);
+        return format!("Global\\COPE_TEST_MUTEX_{:x}", hasher.finish());
+    }
+    GLOBAL_MUTEX_NAME.to_string()
+}
+
+fn test_daemon_mode() -> bool {
+    std::env::var("COPE_TEST_DAEMON_MODE").as_deref() == Ok("ready")
+}
 
 pub fn startup_command(exe_path: &std::path::Path) -> String {
     format!("\"{}\" daemon", exe_path.display())
@@ -47,18 +64,12 @@ pub fn current_exe_path() -> Result<PathBuf> {
 }
 
 pub fn installed_exe_path() -> Result<PathBuf> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\Users\\User\\AppData\\Local"));
-    let path = local_app_data.join("COPE").join("cope.exe");
-    Ok(path)
+    let dir = crate::config::config_dir()?;
+    Ok(dir.join("cope.exe"))
 }
 
 pub fn installed_cope_dir() -> Result<PathBuf> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\Users\\User\\AppData\\Local"));
-    Ok(local_app_data.join("COPE"))
+    crate::config::config_dir()
 }
 
 pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
@@ -92,15 +103,63 @@ pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-pub fn start_background(exe_path: Option<PathBuf>) -> Result<()> {
+/// Acquire a global mutex to ensure only one COPE daemon runs system-wide.
+/// Returns the mutex handle if acquired, None if already held by another process.
+pub fn acquire_global_mutex() -> Result<Option<HANDLE>> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+
+    let mutex_name: Vec<u16> = global_mutex_name()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) };
+
+    match handle {
+        Ok(h) if !h.is_invalid() => {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_ALREADY_EXISTS {
+                // Mutex already exists - another instance is running
+                let _ = unsafe { CloseHandle(h) };
+                Ok(None)
+            } else {
+                Ok(Some(h))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Release the global mutex.
+pub fn release_global_mutex(handle: HANDLE) {
+    let _ = unsafe { CloseHandle(handle) };
+}
+
+pub fn ensure_single_instance() -> Result<Option<HANDLE>> {
+    acquire_global_mutex()
+}
+
+/// Start the COPE daemon in the background.
+///
+/// Idempotent lifecycle semantics:
+/// - `Ok(true)`  — a new daemon was started.
+/// - `Ok(false)` — a daemon was already running; nothing was spawned.
+///   This is NOT an error.
+/// - `Err`       — genuine startup failure (spawn error or startup timeout).
+pub fn start_background(exe_path: Option<PathBuf>) -> Result<bool> {
     if is_daemon_running()? {
-        anyhow::bail!("COPE daemon is already running.");
+        return Ok(false);
     }
 
-    let path = exe_path
-        .unwrap_or_else(|| installed_exe_path().expect("failed to determine installed exe path"));
+    let path = match exe_path {
+        Some(path) => path,
+        None => installed_exe_path()?,
+    };
 
     use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     let child = Command::new(&path)
         .arg("daemon")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
@@ -109,21 +168,44 @@ pub fn start_background(exe_path: Option<PathBuf>) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
 
-    let pid = child.id();
-    let pid_path = daemon_pid_path()?;
-    std::fs::write(&pid_path, pid.to_string())?;
-    Ok(())
+    drop(child);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("COPE daemon did not confirm startup within timeout.");
+        }
+
+        if is_daemon_running()? {
+            return Ok(true);
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub fn run_daemon(config: crate::config::Config) -> Result<()> {
-    write_daemon_pid()?;
+    // Deterministic lifecycle tests use a sleeping daemon so they never depend
+    // on desktop-global RegisterHotKey ownership. This seam is inert unless
+    // the explicit test value is present and is not part of normal operation.
+    if test_daemon_mode() {
+        write_daemon_pid()?;
+        std::thread::park();
+        return Ok(());
+    }
 
     let config = Arc::new(std::sync::RwLock::new(config));
     let mut manager = HotkeyManager::new(config.clone())?;
     manager.register_hotkeys()?;
-    manager.run()?;
+    if !manager.get_failed_registrations().is_empty() {
+        anyhow::bail!("One or more required global hotkeys could not be registered");
+    }
 
-    cleanup_daemon_pid()?;
+    write_daemon_pid()?;
+    let run_result = manager.run();
+    let cleanup_result = cleanup_daemon_pid();
+    run_result?;
+    cleanup_result?;
     Ok(())
 }
 
@@ -147,45 +229,44 @@ fn cleanup_daemon_pid() -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_single_instance() -> Result<single_instance::SingleInstance> {
-    let instance =
-        single_instance::SingleInstance::new("COPE").map_err(|e| anyhow::anyhow!("{}", e))?;
-    Ok(instance)
-}
-
-fn is_pid_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    unsafe {
-        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(h) if !h.is_invalid() => h,
-            _ => return false,
-        };
-
-        let mut exit_code = 0u32;
-        let result = GetExitCodeProcess(handle, &mut exit_code);
-        let _ = CloseHandle(handle);
-
-        result.is_ok() && exit_code == 259 // STILL_ACTIVE
+fn read_daemon_pid() -> Result<Option<u32>> {
+    let pid_path = daemon_pid_path()?;
+    if !pid_path.exists() {
+        return Ok(None);
     }
-}
 
-fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+    let pid_str = std::fs::read_to_string(&pid_path)?;
+    let pid: u32 = match pid_str.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(None);
+        }
     };
 
-    unsafe {
-        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(h) if !h.is_invalid() => h,
-            _ => return None,
-        };
+    if pid == 0 {
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(None);
+    }
 
+    Ok(Some(pid))
+}
+
+/// Verify that the given process handle points to the installed COPE daemon
+/// by comparing its executable path against the expected install location.
+///
+/// Uses the SAME handle for both query and comparison — the caller must
+/// ensure this handle was opened with PROCESS_QUERY_LIMITED_INFORMATION.
+fn verify_handle_is_cope_daemon(handle: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_FORMAT};
+
+    let installed_path = match installed_exe_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let installed_str = installed_path.to_string_lossy().to_lowercase();
+
+    unsafe {
         let mut buf = vec![0u16; 520];
         let mut size = buf.len() as u32;
 
@@ -196,55 +277,49 @@ fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
             &mut size,
         );
 
-        let _ = CloseHandle(handle);
-
         if result.is_ok() && size > 0 {
             let path_str = String::from_utf16_lossy(&buf[..size as usize]);
-            Some(PathBuf::from(path_str))
+            path_str.to_lowercase() == installed_str
         } else {
-            None
+            false
         }
     }
 }
 
-fn is_pid_cope_daemon(pid: u32) -> bool {
-    let installed_path = match installed_exe_path() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
+fn is_handle_alive(handle: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::System::Threading::GetExitCodeProcess;
 
-    let installed_str = installed_path.to_string_lossy().to_lowercase();
-
-    if let Some(exe_path) = get_process_exe_path(pid) {
-        let exe_str = exe_path.to_string_lossy().to_lowercase();
-        exe_str == installed_str
-    } else {
-        false
+    unsafe {
+        let mut exit_code = 0u32;
+        let result = GetExitCodeProcess(handle, &mut exit_code);
+        result.is_ok() && exit_code == 259 // STILL_ACTIVE
     }
 }
 
 pub fn is_daemon_running() -> Result<bool> {
-    let pid_path = daemon_pid_path()?;
-    if !pid_path.exists() {
-        return Ok(false);
-    }
+    let pid = match read_daemon_pid()? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
 
-    let pid_str = std::fs::read_to_string(&pid_path)?;
-    let pid: u32 = match pid_str.trim().parse() {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = std::fs::remove_file(&pid_path);
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+    let handle = match handle {
+        Ok(h) if !h.is_invalid() => h,
+        _ => {
+            let _ = std::fs::remove_file(daemon_pid_path()?);
             return Ok(false);
         }
     };
 
-    if pid == 0 {
-        let _ = std::fs::remove_file(&pid_path);
-        return Ok(false);
-    }
+    let alive = is_handle_alive(handle);
+    let is_cope = verify_handle_is_cope_daemon(handle);
+    let _ = unsafe { CloseHandle(handle) };
 
-    if !is_pid_alive(pid) || !is_pid_cope_daemon(pid) {
-        let _ = std::fs::remove_file(&pid_path);
+    if !alive || !is_cope {
+        let _ = std::fs::remove_file(daemon_pid_path()?);
         return Ok(false);
     }
 
@@ -252,58 +327,84 @@ pub fn is_daemon_running() -> Result<bool> {
 }
 
 pub fn stop_daemon() -> Result<bool> {
-    let pid_path = daemon_pid_path()?;
-    if !pid_path.exists() {
-        return Ok(false);
-    }
-
-    let pid_str = std::fs::read_to_string(&pid_path)?;
-    let pid: u32 = match pid_str.trim().parse() {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = std::fs::remove_file(&pid_path);
-            return Ok(false);
-        }
+    let pid = match read_daemon_pid()? {
+        Some(p) => p,
+        None => return Ok(false),
     };
-
-    if pid == 0 {
-        let _ = std::fs::remove_file(&pid_path);
-        return Ok(false);
-    }
-
-    if !is_pid_cope_daemon(pid) {
-        let _ = std::fs::remove_file(&pid_path);
-        return Ok(false);
-    }
 
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
-    unsafe {
-        let handle = match OpenProcess(PROCESS_TERMINATE, false, pid) {
-            Ok(h) if !h.is_invalid() => h,
-            _ => {
-                let _ = std::fs::remove_file(&pid_path);
-                return Ok(false);
-            }
-        };
-
-        let result = TerminateProcess(handle, 0);
-        let _ = CloseHandle(handle);
-
-        if result.is_err() {
-            let _ = std::fs::remove_file(&pid_path);
+    // Open with both query and terminate permissions so we can verify identity
+    // and terminate using the SAME handle — eliminating the TOCTOU window.
+    let handle = unsafe {
+        OpenProcess(
+            windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_TERMINATE,
+            false,
+            pid,
+        )
+    };
+    let handle = match handle {
+        Ok(h) if !h.is_invalid() => h,
+        _ => {
+            // Cannot open process — PID is stale/dead. Safe to remove.
+            let _ = std::fs::remove_file(daemon_pid_path()?);
             return Ok(false);
         }
+    };
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    // Verify identity using the SAME handle we will terminate
+    if !verify_handle_is_cope_daemon(handle) {
+        let _ = unsafe { CloseHandle(handle) };
+        // PID points to an unrelated process — stale. Safe to remove.
+        let _ = std::fs::remove_file(daemon_pid_path()?);
+        return Ok(false);
+    }
 
-        if is_pid_alive(pid) {
-            anyhow::bail!("COPE daemon process {} could not be terminated.", pid);
+    // Terminate using the SAME handle we just verified.
+    // PID file is NOT removed until we confirm the process actually exited.
+    let result = unsafe { TerminateProcess(handle, 0) };
+    let _ = unsafe { CloseHandle(handle) };
+
+    if result.is_err() {
+        // TerminateProcess failed. Daemon is still running. Preserve PID file
+        // so `cope status` can still identify the daemon.
+        anyhow::bail!(
+            "Failed to terminate COPE daemon process {}. The process may lack permissions.",
+            pid
+        );
+    }
+
+    // Wait briefly for graceful shutdown, then verify exit.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Post-termination check: open a fresh handle just to confirm the process is gone.
+    if let Some(verify_handle) = open_process_for_query(pid) {
+        let still_alive = is_handle_alive(verify_handle);
+        let _ = unsafe { CloseHandle(verify_handle) };
+        if still_alive {
+            // Process did not exit. Preserve PID file so status still works.
+            anyhow::bail!(
+                "COPE daemon process {} did not exit after termination.",
+                pid
+            );
         }
+    }
 
-        let _ = std::fs::remove_file(&pid_path);
-        Ok(true)
+    // Process confirmed dead. Now safe to remove PID file.
+    let _ = std::fs::remove_file(daemon_pid_path()?);
+    Ok(true)
+}
+
+fn open_process_for_query(pid: u32) -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        if handle.is_invalid() {
+            return None;
+        }
+        Some(handle)
     }
 }
 
@@ -339,6 +440,53 @@ mod tests {
         assert_eq!(
             startup_command(path),
             r#""C:\Users\John Doe\AppData\Local\COPE\cope.exe" daemon"#
+        );
+    }
+
+    // --- Daemon stop PID file lifecycle tests ---
+
+    use crate::config::config_dir;
+
+    fn write_fake_pid_file(pid: u32) -> std::path::PathBuf {
+        let pid_path = config_dir().unwrap().join("daemon.pid");
+        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+        pid_path
+    }
+
+    #[test]
+    fn test_stop_daemon_no_pid_file_returns_false() {
+        let pid_path = config_dir().unwrap().join("daemon.pid");
+        let _ = std::fs::remove_file(&pid_path);
+        let result = stop_daemon().unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_stop_daemon_stale_pid_removes_pid_file() {
+        // PID 1 exists (System Idle Process) but is not a COPE daemon.
+        // The stale-PID branch (verify_handle_is_cope_daemon returns false)
+        // should remove the PID file and return Ok(false).
+        let pid_path = config_dir().unwrap().join("daemon.pid");
+        write_fake_pid_file(1);
+        let result = stop_daemon().unwrap();
+        assert!(!result);
+        assert!(
+            !pid_path.exists(),
+            "PID file should be removed for stale PID"
+        );
+    }
+
+    #[test]
+    fn test_stop_daemon_nonexistent_pid_removes_pid_file() {
+        // PID 99999 does not exist. OpenProcess fails -> stale -> remove.
+        let pid_path = config_dir().unwrap().join("daemon.pid");
+        write_fake_pid_file(99999);
+        let result = stop_daemon().unwrap();
+        assert!(!result);
+        assert!(
+            !pid_path.exists(),
+            "PID file should be removed when PID does not exist"
         );
     }
 }

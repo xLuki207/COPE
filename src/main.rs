@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod history;
 mod hotkeys;
 mod parser;
 mod routes;
@@ -9,7 +10,7 @@ use cli::{execute, Cli, Commands};
 use config::Config;
 use log::error;
 use std::process;
-use windows::ensure_single_instance;
+use windows::{ensure_single_instance, release_global_mutex};
 
 fn enable_ansi_support() {
     extern "system" {
@@ -38,38 +39,29 @@ fn main() {
     if matches!(cli.command, Commands::Daemon) {
         env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
-        let _instance = match ensure_single_instance() {
-            Ok(inst) => inst,
+        let mutex_handle = match ensure_single_instance() {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                process::exit(1);
+            }
             Err(_) => {
                 process::exit(1);
             }
         };
 
         let config = Config::load().unwrap_or_default();
-        if let Err(e) = windows::run_daemon(config) {
+        let result = windows::run_daemon(config);
+        release_global_mutex(mutex_handle);
+        if let Err(e) = result {
             error!("Daemon error: {}", e);
             process::exit(1);
         }
     } else if matches!(cli.command, Commands::Help) {
         println!("{}", Cli::help());
         process::exit(0);
-    } else if matches!(cli.command, Commands::Start) {
-        env_logger::init_from_env(env_logger::Env::default().default_filter_or("warn"));
-
-        let _instance = match ensure_single_instance() {
-            Ok(inst) => inst,
-            Err(_) => {
-                eprintln!("Another instance of COPE is already running.");
-                process::exit(1);
-            }
-        };
-
-        if let Err(e) = windows::start_background(None) {
-            eprintln!("COPE start error: {}", e);
-            process::exit(1);
-        }
-
-        println!("COPE started.");
+    } else if matches!(cli.command, Commands::Version) {
+        println!("cope v0.1.0");
+        process::exit(0);
     } else {
         env_logger::init_from_env(env_logger::Env::default().default_filter_or("warn"));
 

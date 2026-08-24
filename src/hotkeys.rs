@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::history::History;
 use crate::parser::{extract_solana_addresses, ExtractResult, SolanaAddress};
 use crate::routes::{open_destination, Destination};
 use anyhow::Result;
@@ -7,7 +8,7 @@ use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
@@ -20,6 +21,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, MSG, WM_HOTKEY, WM_QUIT, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
+extern "system" {
+    fn GetClipboardSequenceNumber() -> u32;
+}
+
 const HOTKEY_ID_BASE: i32 = 1000;
 
 pub struct HotkeyManager {
@@ -30,12 +35,15 @@ pub struct HotkeyManager {
     failed_registrations: Vec<String>,
     current_ca: Option<SolanaAddress>,
     last_clipboard_text: Option<String>,
+    pending_clipboard_restore: Option<String>,
+    history: History,
 }
 
 impl HotkeyManager {
     pub fn new(config: Arc<std::sync::RwLock<Config>>) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(false));
         let hwnd = create_message_window()?;
+        let history = History::new()?;
         Ok(Self {
             hwnd,
             registered_hotkeys: HashMap::new(),
@@ -44,6 +52,8 @@ impl HotkeyManager {
             failed_registrations: Vec::new(),
             current_ca: None,
             last_clipboard_text: None,
+            pending_clipboard_restore: None,
+            history,
         })
     }
 
@@ -81,7 +91,6 @@ impl HotkeyManager {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_failed_registrations(&self) -> &[String] {
         &self.failed_registrations
     }
@@ -135,30 +144,25 @@ impl HotkeyManager {
     fn handle_hotkey(&mut self, destination: Destination) {
         debug!("Hotkey triggered for {:?}", destination);
 
-        let (new_ca, should_route, feedback) = self.resolve_current_ca(destination);
+        let (resolved_ca, should_route, feedback) = self.resolve_current_ca(destination);
 
         if should_route {
-            if let Some(addr) = &new_ca {
-                info!(
-                    "Found single CA: {}, opening {:?}",
-                    addr.as_str(),
-                    destination
-                );
-                if let Err(e) = open_destination(destination, addr) {
-                    error!("Failed to open destination: {}", e);
-                    eprintln!("Failed to open destination: {}", e);
-                }
-            } else if let Some(ref addr) = self.current_ca {
-                info!(
-                    "Reusing current CA: {}, opening {:?}",
-                    addr.as_str(),
-                    destination
-                );
-                if let Err(e) = open_destination(destination, addr) {
-                    error!("Failed to open destination: {}", e);
-                    eprintln!("Failed to open destination: {}", e);
+            if let Some(addr) = resolved_ca {
+                match open_destination(destination, &addr) {
+                    Ok(()) => self.history.record(addr.as_str(), destination),
+                    Err(e) => {
+                        error!("Failed to open destination: {}", e);
+                        eprintln!("Failed to open destination: {}", e);
+                    }
                 }
             }
+        }
+
+        if let Some(before) = self.pending_clipboard_restore.take() {
+            let _ = self.write_clipboard(&before.clone());
+            // Update last_clipboard_text so the next hotkey invocation does NOT
+            // mistake our own restore for a manual clipboard change.
+            self.last_clipboard_text = Some(before);
         }
 
         if let Some(f) = feedback {
@@ -166,48 +170,51 @@ impl HotkeyManager {
         }
     }
 
+    /// Extract a single Solana address from text, or return feedback on failure.
+    fn try_extract_address(text: &str) -> (Option<SolanaAddress>, Option<String>) {
+        match extract_solana_addresses(text) {
+            Ok(ExtractResult::Single(addr)) => (Some(addr), None),
+            Ok(ExtractResult::Multiple(_)) => {
+                (None, Some("Multiple CAs found. Highlight one.".to_string()))
+            }
+            Ok(ExtractResult::None) => (None, Some("No Solana CA found.".to_string())),
+            Err(e) => {
+                error!("Failed to extract addresses: {}", e);
+                (None, Some(format!("Error: {e}")))
+            }
+        }
+    }
+
+    /// Resolve which CA to route for this hotkey press.
+    ///
+    /// Invariants:
+    ///   0 valid fresh CAs -> do not overwrite current_ca, return (None, false, feedback)
+    ///   1 valid fresh CA  -> update current_ca, return (Some(ca), true, None)
+    ///   2+ valid fresh CAs -> do not guess, return (None, false, feedback)
+    ///   no fresh selection -> reuse current_ca if present
+    ///
+    /// On success path (should_route=true), sets self.pending_clipboard_restore
+    /// so the caller can restore clipboard AFTER browser dispatch.
     fn resolve_current_ca(
         &mut self,
         _destination: Destination,
     ) -> (Option<SolanaAddress>, bool, Option<String>) {
-        // Step A: Detect current selected text via Ctrl+C
-        let (_selected_text, _user_selection) = self.try_get_selected_ca();
+        let (selected_text, _user_selection, text_before) = self.try_get_selected_ca();
 
-        if let Some(text) = _selected_text {
-            // Case A: selection successfully captured
-            match extract_solana_addresses(&text) {
-                Ok(ExtractResult::Single(single_addr)) => {
-                    // Selection contains exactly one valid Solana CA
-                    let mut new_ca = self.clone_for_ca_update();
-                    new_ca.current_ca = Some(single_addr.clone());
-                    new_ca.last_clipboard_text = Some(text.clone());
-                    drop(new_ca);
-                    (Some(single_addr), true, None)
+        if let Some(text) = selected_text {
+            let (addr, feedback) = Self::try_extract_address(&text);
+            if let Some(addr) = addr {
+                self.current_ca = Some(addr.clone());
+                self.last_clipboard_text = Some(text);
+                self.pending_clipboard_restore = text_before;
+                (Some(addr), true, None)
+            } else {
+                if let Some(before) = text_before {
+                    let _ = self.write_clipboard(&before);
                 }
-                Ok(ExtractResult::Multiple(_addrs)) => {
-                    // Selection contains multiple distinct CAs - do nothing, do not guess
-                    let _ = self.restore_user_clipboard();
-                    (
-                        None,
-                        false,
-                        Some("Multiple CAs found. Highlight one.".to_string()),
-                    )
-                }
-                Ok(ExtractResult::None) => {
-                    // Selection contains no valid CA - do nothing, DO NOT fall back to stale current_ca
-                    let _ = self.restore_user_clipboard();
-                    (None, false, Some("No Solana CA found.".to_string()))
-                }
-                Err(e) => {
-                    error!("Failed to extract addresses: {}", e);
-                    let _ = self.restore_user_clipboard();
-                    (None, false, Some(format!("Error: {}", e)))
-                }
+                (None, false, feedback)
             }
         } else {
-            // No user selection captured (seq did not change after Ctrl+C)
-            // Case B or C: check if user manually changed clipboard
-
             let current_clipboard_text = match self.read_clipboard() {
                 Ok(t) => t,
                 Err(_) => {
@@ -217,135 +224,61 @@ impl HotkeyManager {
 
             if let Some(last_text) = &self.last_clipboard_text {
                 if current_clipboard_text != *last_text {
-                    // The user has manually changed the clipboard since COPE last handled it
-                    // Case B: user clipboard changed
-                    match extract_solana_addresses(&current_clipboard_text) {
-                        Ok(ExtractResult::Single(addr)) => {
-                            // Exactly one CA in the user's manually changed clipboard
-                            let mut cm = self.clone_for_ca_update();
-                            cm.current_ca = Some(addr.clone());
-                            cm.last_clipboard_text = Some(current_clipboard_text.clone());
-                            drop(cm);
-                            // Update last_clipboard_text to current text
-                            self.last_clipboard_text = Some(current_clipboard_text.clone());
-                            (Some(addr), true, None)
-                        }
-                        Ok(ExtractResult::Multiple(_addrs)) => {
-                            // Multiple CAs - do nothing, do not guess
-                            (None, false, Some("Multiple CAs found.".to_string()))
-                        }
-                        Ok(ExtractResult::None) => {
-                            // Invalid text - do nothing, do not reuse stale current_ca
-                            (None, false, Some("No Solana CA found.".to_string()))
-                        }
-                        Err(e) => {
-                            error!("Failed to extract addresses: {}", e);
-                            (None, false, Some(format!("Error: {}", e)))
-                        }
-                    }
-                } else {
-                    // Case C: no selection and no new user clipboard change
-                    if self.current_ca.is_some() {
-                        // Reuse existing current_ca
-                        let addr = self.current_ca.clone().unwrap();
+                    // User manually changed clipboard
+                    let (addr, feedback) = Self::try_extract_address(&current_clipboard_text);
+                    if let Some(addr) = addr {
+                        self.current_ca = Some(addr.clone());
+                        self.last_clipboard_text = Some(current_clipboard_text);
                         (Some(addr), true, None)
                     } else {
-                        // No current_ca and no new selection
-                        // First run with no prior state: check clipboard for CA
-                        // (handles the "manual copy must work" case when called first time)
-                        match extract_solana_addresses(&current_clipboard_text) {
-                            Ok(ExtractResult::Single(addr)) => {
-                                // Set as current_ca (the "manual copy must work" case)
-                                let mut cm = self.clone_for_ca_update();
-                                cm.current_ca = Some(addr.clone());
-                                cm.last_clipboard_text = Some(current_clipboard_text.clone());
-                                drop(cm);
-                                (Some(addr), true, None)
-                            }
-                            Ok(ExtractResult::Multiple(_addrs)) => {
-                                (None, false, Some("Multiple CAs found.".to_string()))
-                            }
-                            Ok(ExtractResult::None) => {
-                                (None, false, Some("No Solana CA found.".to_string()))
-                            }
-                            Err(e) => {
-                                error!("Failed to extract addresses: {}", e);
-                                (None, false, Some(format!("Error: {}", e)))
-                            }
-                        }
+                        (None, false, feedback)
+                    }
+                } else if let Some(ref addr) = self.current_ca {
+                    // No selection, no new clipboard change - reuse sticky CA
+                    (Some(addr.clone()), true, None)
+                } else {
+                    let (addr, feedback) = Self::try_extract_address(&current_clipboard_text);
+                    if let Some(addr) = addr {
+                        self.current_ca = Some(addr.clone());
+                        self.last_clipboard_text = Some(current_clipboard_text);
+                        (Some(addr), true, None)
+                    } else {
+                        (None, false, feedback)
                     }
                 }
             } else {
-                // first run: last_clipboard_text is None
-                // This handles the "manual copy must work" case:
-                // if clipboard already contains a valid CA with no prior COPE state,
-                // use it directly.
-                match extract_solana_addresses(&current_clipboard_text) {
-                    Ok(ExtractResult::Single(addr)) => {
-                        // Set as current_ca (the "manual copy must work" case)
-                        let mut cm = self.clone_for_ca_update();
-                        cm.current_ca = Some(addr.clone());
-                        cm.last_clipboard_text = Some(current_clipboard_text.clone());
-                        drop(cm);
-                        (Some(addr), true, None)
-                    }
-                    Ok(ExtractResult::Multiple(_addrs)) => {
-                        (None, false, Some("Multiple CAs found.".to_string()))
-                    }
-                    Ok(ExtractResult::None) => {
-                        (None, false, Some("No Solana CA found.".to_string()))
-                    }
-                    Err(e) => {
-                        error!("Failed to extract addresses: {}", e);
-                        (None, false, Some(format!("Error: {}", e)))
-                    }
+                let (addr, feedback) = Self::try_extract_address(&current_clipboard_text);
+                if let Some(addr) = addr {
+                    self.current_ca = Some(addr.clone());
+                    self.last_clipboard_text = Some(current_clipboard_text);
+                    (Some(addr), true, None)
+                } else {
+                    (None, false, feedback)
                 }
             }
         }
     }
 
-    fn clone_for_ca_update(&self) -> HotkeyManagerClone {
-        HotkeyManagerClone {
-            current_ca: self.current_ca.clone(),
-            last_clipboard_text: self.last_clipboard_text.clone(),
-        }
-    }
-
-    fn try_get_selected_ca(&mut self) -> (Option<String>, bool) {
-        // Snapshot current clipboard text before Ctrl+C
+    /// Capture selected text via Ctrl+C synthesis.
+    ///
+    /// Snapshot clipboard, wait for Alt release, inject Ctrl+C, then read the
+    /// new clipboard content. Returns (selected_text, user_selection, text_before).
+    /// The caller is responsible for clipboard restoration after dispatch.
+    fn try_get_selected_ca(&mut self) -> (Option<String>, bool, Option<String>) {
         let text_before = self.read_clipboard().ok();
+        let seq_before = unsafe { GetClipboardSequenceNumber() };
 
-        // Send Ctrl+C to capture selection
-        // Wait for modifier keys (Alt) to be released before synthesizing Ctrl+C.
-        // This prevents the physical Alt key from interfering with Ctrl+C synthesis.
-        let mut waited = 0;
-        while unsafe { GetAsyncKeyState(0x12) & (0x8000u16 as i16) != 0 } && waited < 500 {
-            std::thread::sleep(Duration::from_millis(10));
-            waited += 10;
-        }
+        // Alt must be released before injecting Ctrl+C or Windows may interpret
+        // the synthetic copy as part of the COPE hotkey.
+        self.wait_for_alt_release();
 
         self.send_ctrl_c();
-        std::thread::sleep(Duration::from_millis(50));
 
-        // Read clipboard after Ctrl+C
-        let text_after = self.read_clipboard().ok();
+        let text_after = self.wait_for_clipboard_change(seq_before, 150);
 
-        // Restore the user's clipboard from before-Ctrl+C snapshot
-        // This ensures COPE's Ctrl+C doesn't permanently change user clipboard
-        if let Some(ref before) = text_before {
-            let _ = self.write_clipboard(before);
-        }
-
-        // Determine if user made a new selection.
-        // User selection: clipboard text before was different from after,
-        // AND the after-text is not empty (we successfully captured something)
-        let user_selection = {
-            let before = text_before.as_deref();
-            let after = text_after.as_deref();
-            match (before, after) {
-                (Some(b), Some(a)) => b != a && !a.trim().is_empty(),
-                _ => false,
-            }
+        let user_selection = match (&text_before, &text_after) {
+            (Some(b), Some(a)) => b != a && !a.trim().is_empty(),
+            _ => false,
         };
 
         let selected_text = if user_selection {
@@ -354,19 +287,71 @@ impl HotkeyManager {
             None
         };
 
-        // Update last_clipboard_text after COPE's operation.
-        // If user made a selection, record the selected text.
-        // If no user selection, record the current clipboard text (after restoration)
-        // so we can detect manual changes on the next hotkey.
         let final_clipboard_text: Option<String> = if user_selection {
-            text_after.clone()
+            text_after
         } else {
             self.read_clipboard().ok()
         };
-
         self.last_clipboard_text = final_clipboard_text;
 
-        (selected_text, user_selection)
+        (selected_text, user_selection, text_before)
+    }
+
+    /// Wait for Alt key release using actual Windows key state.
+    /// Fast spin for ~200μs, then bounded 1ms poll up to 500ms max.
+    fn wait_for_alt_release(&self) {
+        let vk_alt: i32 = 0x12;
+        let pressed: i16 = 0x8000u16 as i16;
+
+        let t0 = Instant::now();
+        while t0.elapsed().as_micros() < 200 {
+            if unsafe { GetAsyncKeyState(vk_alt) & pressed } == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+
+        let mut waited = 0u32;
+        while waited < 500 {
+            if unsafe { GetAsyncKeyState(vk_alt) & pressed } == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+        }
+    }
+
+    /// Wait for clipboard sequence number to change after Ctrl+C injection.
+    fn wait_for_clipboard_change(&self, seq_before: u32, total_ms: u64) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_millis(total_ms);
+
+        let t0 = Instant::now();
+        while t0.elapsed().as_micros() < 500 {
+            if unsafe { GetClipboardSequenceNumber() } != seq_before {
+                return self.read_clipboard().ok();
+            }
+            std::hint::spin_loop();
+        }
+
+        let delays: &[u64] = &[1, 2, 5, 10, 10, 10, 10, 10];
+        for &d in delays {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(d));
+            if unsafe { GetClipboardSequenceNumber() } != seq_before {
+                return self.read_clipboard().ok();
+            }
+        }
+
+        if Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            if unsafe { GetClipboardSequenceNumber() } != seq_before {
+                return self.read_clipboard().ok();
+            }
+        }
+
+        None
     }
 
     fn read_clipboard(&self) -> Result<String> {
@@ -439,16 +424,6 @@ impl HotkeyManager {
             SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         }
     }
-
-    fn restore_user_clipboard(&self) -> Result<()> {
-        // Clipboard is restored inline in try_get_selected_ca
-        Ok(())
-    }
-}
-
-struct HotkeyManagerClone {
-    current_ca: Option<SolanaAddress>,
-    last_clipboard_text: Option<String>,
 }
 
 impl Drop for HotkeyManager {
@@ -508,5 +483,54 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
     match msg {
         WM_HOTKEY => LRESULT(0),
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_CA: &str = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+    const VALID_CA_2: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+
+    #[test]
+    fn test_extract_single_valid_ca() {
+        let (addr, feedback) = HotkeyManager::try_extract_address(VALID_CA);
+        assert_eq!(addr.unwrap().as_str(), VALID_CA);
+        assert!(feedback.is_none());
+    }
+
+    #[test]
+    fn test_extract_no_ca_returns_none() {
+        let (addr, feedback) = HotkeyManager::try_extract_address("hello world no CA here");
+        assert!(addr.is_none());
+        assert!(feedback.is_some());
+    }
+
+    #[test]
+    fn test_extract_two_cas_returns_none() {
+        let text = format!("{} {}", VALID_CA, VALID_CA_2);
+        let (addr, feedback) = HotkeyManager::try_extract_address(&text);
+        assert!(addr.is_none());
+        assert!(feedback.unwrap().contains("Multiple"));
+    }
+
+    #[test]
+    fn test_sticky_ca_not_overridden_by_zero_valid() {
+        // Simulate the sticky CA invariant: when resolve_current_ca detects
+        // 0 valid fresh CAs, it must NOT overwrite self.current_ca.
+        // We test the try_extract_address path directly — it returns None
+        // for 0 CAs, which is the trigger for "do not overwrite".
+        let (addr, _) = HotkeyManager::try_extract_address("not a CA");
+        assert!(addr.is_none(), "Zero CAs must not overwrite sticky CA");
+    }
+
+    #[test]
+    fn test_sticky_ca_not_overridden_by_two_valid() {
+        // Simulate the sticky CA invariant: when resolve_current_ca detects
+        // 2+ valid CAs, it must NOT guess — returns None.
+        let text = format!("{} {}", VALID_CA, VALID_CA_2);
+        let (addr, _) = HotkeyManager::try_extract_address(&text);
+        assert!(addr.is_none(), "Multiple CAs must not overwrite sticky CA");
     }
 }

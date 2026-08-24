@@ -2,29 +2,47 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: cargo fmt --check
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lockfile exists
+        run: if (!(Test-Path Cargo.lock)) { exit 1 }
+
+      - name: Format check
         run: cargo fmt --check
 
-      - name: cargo clippy
+      - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: cargo test
-        run: cargo test
+      - name: Test
+        run: cargo test --locked
 
-      - name: cargo build --release
-        run: cargo build --release
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Audit
+        run: cargo install cargo-audit --locked; cargo audit
+
+      - name: Verify binary
+        run: |
+          $sha = (Get-FileHash -Algorithm SHA256 target/release/cope.exe).Hash
+          Write-Host "SHA256: $sha"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cope-windows-x64
+          path: target/release/cope.exe

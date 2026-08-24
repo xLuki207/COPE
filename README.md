@@ -10,14 +10,17 @@ COPE opens it in your Windows default browser.
 
 ## Routes
 
-| Hotkey   | Destination |
-|----------|-------------|
-| Alt+G    | GMGN        |
-| Alt+X    | X Search    |
-| Alt+D    | DexScreener |
-| Alt+P    | Pump.fun    |
-| Alt+F    | FOMO        |
-| Alt+S    | Solscan     |
+| Hotkey   | Destination | Notes |
+|----------|-------------|-------|
+| Alt+A    | Axiom       | Direct token URL |
+| Alt+G    | GMGN        | Direct token URL |
+| Alt+X    | X Search    | Direct token URL |
+| Alt+D    | DexScreener | Direct token URL |
+| Alt+P    | Pump.fun    | Direct token URL |
+| Alt+F    | FOMO        | Direct token URL |
+| Alt+S    | Solscan     | Direct token URL |
+| Alt+Q    | RugCheck    | Direct token URL |
+| Alt+B    | Bundle Checker | Trench Radar clusters deep-link for this CA |
 
 ## Install
 
@@ -35,12 +38,19 @@ After installation, a new terminal can use:
 - `cope start` - start COPE daemon
 - `cope stop` - stop COPE daemon
 - `cope uninstall` - remove COPE
+- `cope history` - show recent successful routes
+- `cope history --all` - show all readable history entries
+- `cope history clear` - clear local history
 
 ## Usage
 
 - Highlight any Solana contract address (CA) and press the associated hotkey to route it.
 - Or manually copy a CA to the clipboard and press the hotkey - COPE will extract it.
 - Each hotkey opens the selected destination URL in your Windows default browser.
+- A single newly selected valid CA becomes the sticky current CA. Empty or ambiguous
+  selections do not replace it; with no new selection, hotkeys reuse the sticky CA.
+- COPE restores the clipboard after selection capture and records only successful
+  browser dispatches in local JSONL history.
 
 ## Commands
 
@@ -68,7 +78,26 @@ COPE is local-only software with no cloud dependencies:
 - **selection capture only when a COPE hotkey is pressed** - no continuous monitoring
 
 COPE locally extracts and validates plausible Solana addresses from selected text.
-It does not verify on-chain memecoin status or guarantee token support at any destination.
+It does not verify on-chain memecoin status, guarantee safe tokens, guarantee rug
+detection, or guarantee bundle detection at any destination. The Bundle Checker
+route opens Trench Radar's token-specific clusters page.
+
+Configuration, PID state, and history are stored under `%LOCALAPPDATA%\COPE\`.
+If Windows does not provide `LOCALAPPDATA`, COPE fails safely instead of writing to
+a guessed user path.
+
+## Source structure
+
+```
+src/main.rs      entry point + ANSI support
+src/cli.rs       command-line interface
+src/hotkeys.rs   global hotkeys + selection capture
+src/parser.rs    Solana CA validation
+src/routes.rs    destination URL routing
+src/windows.rs   install/startup/process integration
+src/history.rs   local route history
+src/config.rs    configuration persistence
+```
 
 ## Build from source
 
