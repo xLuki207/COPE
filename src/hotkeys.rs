@@ -35,6 +35,7 @@ pub struct HotkeyManager {
     failed_registrations: Vec<String>,
     current_ca: Option<SolanaAddress>,
     last_clipboard_text: Option<String>,
+    last_clipboard_sequence: Option<u32>,
     pending_clipboard_restore: Option<String>,
     history: History,
 }
@@ -52,6 +53,7 @@ impl HotkeyManager {
             failed_registrations: Vec::new(),
             current_ca: None,
             last_clipboard_text: None,
+            last_clipboard_sequence: None,
             pending_clipboard_restore: None,
             history,
         })
@@ -163,6 +165,7 @@ impl HotkeyManager {
             // Update last_clipboard_text so the next hotkey invocation does NOT
             // mistake our own restore for a manual clipboard change.
             self.last_clipboard_text = Some(before);
+            self.last_clipboard_sequence = Some(unsafe { GetClipboardSequenceNumber() });
         }
 
         if let Some(f) = feedback {
@@ -199,7 +202,8 @@ impl HotkeyManager {
         &mut self,
         _destination: Destination,
     ) -> (Option<SolanaAddress>, bool, Option<String>) {
-        let (selected_text, _user_selection, text_before) = self.try_get_selected_ca();
+        let (selected_text, _user_selection, text_before, clipboard_sequence_before) =
+            self.try_get_selected_ca();
 
         if let Some(text) = selected_text {
             let (addr, feedback) = Self::try_extract_address(&text);
@@ -212,6 +216,7 @@ impl HotkeyManager {
                 if let Some(before) = text_before {
                     let _ = self.write_clipboard(&before);
                     self.last_clipboard_text = Some(before);
+                    self.last_clipboard_sequence = Some(unsafe { GetClipboardSequenceNumber() });
                 }
                 (None, false, feedback)
             }
@@ -232,6 +237,8 @@ impl HotkeyManager {
             let clipboard_changed = clipboard_changed_since(
                 self.last_clipboard_text.as_deref(),
                 &current_clipboard_text,
+                self.last_clipboard_sequence,
+                clipboard_sequence_before,
             );
 
             // A changed clipboard is a new user-copied coin and must replace
@@ -242,6 +249,7 @@ impl HotkeyManager {
                 if let Some(addr) = addr {
                     self.current_ca = Some(addr.clone());
                     self.last_clipboard_text = Some(current_clipboard_text);
+                    self.last_clipboard_sequence = Some(unsafe { GetClipboardSequenceNumber() });
                     (Some(addr), true, None)
                 } else {
                     (None, false, feedback)
@@ -250,6 +258,7 @@ impl HotkeyManager {
                 // No selection and no new clipboard change: reuse the most
                 // recently selected or copied coin.
                 self.last_clipboard_text = Some(current_clipboard_text);
+                self.last_clipboard_sequence = Some(unsafe { GetClipboardSequenceNumber() });
                 (Some(addr.clone()), true, None)
             } else {
                 (None, false, Some("No Solana CA found.".to_string()))
@@ -260,9 +269,10 @@ impl HotkeyManager {
     /// Capture selected text via Ctrl+C synthesis.
     ///
     /// Snapshot clipboard, wait for Alt release, inject Ctrl+C, then read the
-    /// new clipboard content. Returns (selected_text, user_selection, text_before).
+    /// new clipboard content. Returns (selected_text, user_selection,
+    /// text_before, clipboard_sequence_before).
     /// The caller is responsible for clipboard restoration after dispatch.
-    fn try_get_selected_ca(&mut self) -> (Option<String>, bool, Option<String>) {
+    fn try_get_selected_ca(&mut self) -> (Option<String>, bool, Option<String>, u32) {
         let text_before = self.read_clipboard().ok();
         let seq_before = unsafe { GetClipboardSequenceNumber() };
 
@@ -285,7 +295,7 @@ impl HotkeyManager {
             None
         };
 
-        (selected_text, user_selection, text_before)
+        (selected_text, user_selection, text_before, seq_before)
     }
 
     /// Wait for Alt key release using actual Windows key state.
@@ -420,8 +430,11 @@ impl HotkeyManager {
 fn clipboard_changed_since(
     last_clipboard_text: Option<&str>,
     current_clipboard_text: &str,
+    last_clipboard_sequence: Option<u32>,
+    current_clipboard_sequence: u32,
 ) -> bool {
     last_clipboard_text != Some(current_clipboard_text)
+        || last_clipboard_sequence != Some(current_clipboard_sequence)
 }
 
 impl Drop for HotkeyManager {
@@ -534,12 +547,28 @@ mod tests {
 
     #[test]
     fn test_newly_copied_clipboard_replaces_sticky_snapshot() {
-        assert!(clipboard_changed_since(Some(VALID_CA), VALID_CA_2));
+        assert!(clipboard_changed_since(
+            Some(VALID_CA),
+            VALID_CA_2,
+            Some(10),
+            10
+        ));
     }
 
     #[test]
     fn test_unchanged_clipboard_reuses_sticky_snapshot() {
-        assert!(!clipboard_changed_since(Some(VALID_CA), VALID_CA));
-        assert!(clipboard_changed_since(None, VALID_CA));
+        assert!(!clipboard_changed_since(
+            Some(VALID_CA),
+            VALID_CA,
+            Some(10),
+            10
+        ));
+        assert!(clipboard_changed_since(
+            Some(VALID_CA),
+            VALID_CA,
+            Some(10),
+            11
+        ));
+        assert!(clipboard_changed_since(None, VALID_CA, None, 10));
     }
 }
