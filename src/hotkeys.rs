@@ -211,42 +211,33 @@ impl HotkeyManager {
             } else {
                 if let Some(before) = text_before {
                     let _ = self.write_clipboard(&before);
+                    self.last_clipboard_text = Some(before);
                 }
                 (None, false, feedback)
             }
         } else {
-            let current_clipboard_text = match self.read_clipboard() {
-                Ok(t) => t,
-                Err(_) => {
-                    return (None, false, Some("No Solana CA found.".to_string()));
-                }
+            // `text_before` is the clipboard state before COPE synthesized
+            // Ctrl+C. It is the reliable signal for a manually copied coin.
+            // Do not use a value captured after Ctrl+C: that value can make a
+            // newly copied coin look identical to the previous sticky coin.
+            let current_clipboard_text = match text_before {
+                Some(text) => text,
+                None => match self.read_clipboard() {
+                    Ok(t) => t,
+                    Err(_) => {
+                        return (None, false, Some("No Solana CA found.".to_string()));
+                    }
+                },
             };
+            let clipboard_changed = clipboard_changed_since(
+                self.last_clipboard_text.as_deref(),
+                &current_clipboard_text,
+            );
 
-            if let Some(last_text) = &self.last_clipboard_text {
-                if current_clipboard_text != *last_text {
-                    // User manually changed clipboard
-                    let (addr, feedback) = Self::try_extract_address(&current_clipboard_text);
-                    if let Some(addr) = addr {
-                        self.current_ca = Some(addr.clone());
-                        self.last_clipboard_text = Some(current_clipboard_text);
-                        (Some(addr), true, None)
-                    } else {
-                        (None, false, feedback)
-                    }
-                } else if let Some(ref addr) = self.current_ca {
-                    // No selection, no new clipboard change - reuse sticky CA
-                    (Some(addr.clone()), true, None)
-                } else {
-                    let (addr, feedback) = Self::try_extract_address(&current_clipboard_text);
-                    if let Some(addr) = addr {
-                        self.current_ca = Some(addr.clone());
-                        self.last_clipboard_text = Some(current_clipboard_text);
-                        (Some(addr), true, None)
-                    } else {
-                        (None, false, feedback)
-                    }
-                }
-            } else {
+            // A changed clipboard is a new user-copied coin and must replace
+            // the sticky selected coin. Also initialize from a valid clipboard
+            // coin on the first hotkey press.
+            if clipboard_changed || self.current_ca.is_none() {
                 let (addr, feedback) = Self::try_extract_address(&current_clipboard_text);
                 if let Some(addr) = addr {
                     self.current_ca = Some(addr.clone());
@@ -255,6 +246,13 @@ impl HotkeyManager {
                 } else {
                     (None, false, feedback)
                 }
+            } else if let Some(ref addr) = self.current_ca {
+                // No selection and no new clipboard change: reuse the most
+                // recently selected or copied coin.
+                self.last_clipboard_text = Some(current_clipboard_text);
+                (Some(addr.clone()), true, None)
+            } else {
+                (None, false, Some("No Solana CA found.".to_string()))
             }
         }
     }
@@ -286,13 +284,6 @@ impl HotkeyManager {
         } else {
             None
         };
-
-        let final_clipboard_text: Option<String> = if user_selection {
-            text_after
-        } else {
-            self.read_clipboard().ok()
-        };
-        self.last_clipboard_text = final_clipboard_text;
 
         (selected_text, user_selection, text_before)
     }
@@ -426,6 +417,13 @@ impl HotkeyManager {
     }
 }
 
+fn clipboard_changed_since(
+    last_clipboard_text: Option<&str>,
+    current_clipboard_text: &str,
+) -> bool {
+    last_clipboard_text != Some(current_clipboard_text)
+}
+
 impl Drop for HotkeyManager {
     fn drop(&mut self) {
         let _ = self.unregister_all();
@@ -532,5 +530,16 @@ mod tests {
         let text = format!("{} {}", VALID_CA, VALID_CA_2);
         let (addr, _) = HotkeyManager::try_extract_address(&text);
         assert!(addr.is_none(), "Multiple CAs must not overwrite sticky CA");
+    }
+
+    #[test]
+    fn test_newly_copied_clipboard_replaces_sticky_snapshot() {
+        assert!(clipboard_changed_since(Some(VALID_CA), VALID_CA_2));
+    }
+
+    #[test]
+    fn test_unchanged_clipboard_reuses_sticky_snapshot() {
+        assert!(!clipboard_changed_since(Some(VALID_CA), VALID_CA));
+        assert!(clipboard_changed_since(None, VALID_CA));
     }
 }

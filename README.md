@@ -40,10 +40,10 @@ After installation, open a new terminal to use the `cope` command.
 
 - Highlight a Solana contract address (CA) and press its hotkey.
 - You can also copy a CA to the clipboard before pressing the hotkey.
-- A newly selected valid CA becomes the current CA. If no new selection is found,
-  COPE reuses it. Empty or ambiguous selections do not replace it.
-- COPE restores the clipboard after capture and records successful routes in local
-  JSONL history.
+- The latest valid CA that was either copied or selected becomes the current CA.
+  Empty or ambiguous selections do not replace it.
+- COPE restores the clipboard after selection capture and records successful
+  routes in local JSONL history. History timestamps are shown and stored in UTC.
 
 ## Commands
 

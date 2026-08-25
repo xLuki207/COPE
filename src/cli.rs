@@ -334,7 +334,10 @@ fn cmd_history(all: bool, clear: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("  {DIM}#   {:<52} DATE / TIME{RESET}", "CONTRACT ADDRESS");
+    println!(
+        "  {DIM}#   {:<52} DATE / TIME (UTC){RESET}",
+        "CONTRACT ADDRESS"
+    );
     println!("  {}", "-".repeat(72));
 
     for (i, entry) in entries.iter().enumerate() {

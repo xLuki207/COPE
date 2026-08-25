@@ -33,7 +33,7 @@ impl History {
         let entry = HistoryEntry {
             ca: ca.to_string(),
             destination: destination.display_name().to_string(),
-            timestamp: format_local_time(),
+            timestamp: format_utc_time(),
         };
 
         if let Ok(mut file) = OpenOptions::new()
@@ -104,7 +104,7 @@ impl History {
     }
 }
 
-fn format_local_time() -> String {
+fn format_utc_time() -> String {
     let now = std::time::SystemTime::now();
     let Ok(duration) = now.duration_since(std::time::UNIX_EPOCH) else {
         return String::from("unknown");
@@ -115,6 +115,7 @@ fn format_local_time() -> String {
     let tod = secs % 86400;
     let hours = tod / 3600;
     let minutes = (tod % 3600) / 60;
+    let seconds = tod % 60;
 
     let mut y = 1970i64;
     let mut remaining_days = total_days;
@@ -132,10 +133,6 @@ fn format_local_time() -> String {
     } else {
         [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
-    let names = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
     let mut m = 0;
     for (i, &d) in month_days.iter().enumerate() {
         if remaining_days < d as i64 {
@@ -146,12 +143,13 @@ fn format_local_time() -> String {
     }
 
     format!(
-        "{:02} {} {:04} {:02}:{:02}",
-        remaining_days + 1,
-        names[m],
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
         y,
+        m + 1,
+        remaining_days + 1,
         hours,
-        minutes
+        minutes,
+        seconds
     )
 }
 
@@ -255,10 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_local_time() {
-        let ts = format_local_time();
-        // Should be like "22 Aug 2026 14:30"
-        assert!(ts.len() >= 14);
-        assert!(ts.contains(' '));
+    fn test_format_utc_time() {
+        let ts = format_utc_time();
+        assert!(ts.ends_with(" UTC"));
+        assert_eq!(ts.len(), 23);
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], " ");
     }
 }
