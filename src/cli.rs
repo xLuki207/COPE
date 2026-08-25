@@ -165,10 +165,9 @@ fn cmd_install() -> Result<()> {
     let current_path = paths_key
         .get_value::<String, _>("PATH")
         .unwrap_or_else(|_| String::new());
-    let dir_lower = cope_dir_str.to_lowercase();
     let already_present = current_path
         .split(';')
-        .any(|e| e.trim().to_lowercase() == dir_lower);
+        .any(|e| crate::windows::path_entry_matches_dir(e, &cope_dir));
     if !already_present {
         paths_key.set_value("PATH", &format!("{};{}", current_path, cope_dir_str))?;
     }

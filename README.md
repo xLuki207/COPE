@@ -38,13 +38,19 @@ After installation, open a new terminal to use the `cope` command.
 
 ## Usage
 
-- Highlight a Solana contract address (CA) and press its hotkey.
-- You can also copy a CA to the clipboard before pressing the hotkey.
-- The latest valid CA that was either copied or selected becomes the current CA.
-  Empty or ambiguous selections do not replace it.
-- COPE restores the clipboard after selection capture and records successful
-  routes in local JSONL history. History timestamps are shown and stored in EST
-  (Eastern Standard Time, UTC-5).
+- Highlight either a token or a complete text containing one Solana CA and press
+  its hotkey.
+- You can also copy a token or complete text directly to the clipboard first;
+  this works with apps such as Telegram.
+- The latest valid CA that was copied or selected becomes the current CA. Every
+  later hotkey uses that last CA, regardless of whether the next action is a
+  token selection, a full-text selection, a direct copy, an empty clipboard, or
+  text with no unique CA. Ambiguous text with multiple CAs never replaces it.
+- COPE detects clipboard changes by both content and clipboard sequence, so
+  copying the same CA again still counts as a new input. It restores the
+  clipboard after selection capture and records successful routes in local JSONL
+  history. History timestamps are shown and stored in EST (Eastern Standard
+  Time, UTC-5).
 
 ## Commands
 

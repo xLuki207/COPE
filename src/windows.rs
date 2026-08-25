@@ -125,8 +125,23 @@ pub fn verified_cope_dir() -> Result<PathBuf> {
 }
 
 fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
+    normalize_windows_path(&left.to_string_lossy())
+        == normalize_windows_path(&right.to_string_lossy())
+}
+
+fn normalize_windows_path(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(value.trim())
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase()
+}
+
+/// Compare a PATH entry with a COPE directory, including Windows long-path
+/// prefixed entries such as `\\?\C:\Users\...\COPE`.
+pub fn path_entry_matches_dir(entry: &str, dir: &std::path::Path) -> bool {
+    normalize_windows_path(entry) == normalize_windows_path(&dir.to_string_lossy())
 }
 
 pub fn remove_owned_data_files(dir: &std::path::Path) -> Result<()> {
@@ -368,12 +383,9 @@ pub fn remove_from_user_path(dir: &std::path::Path) -> Result<()> {
         .get_value::<String, _>("PATH")
         .unwrap_or_else(|_| String::new());
 
-    let dir_str = dir.to_string_lossy().to_string();
-    let dir_str_lower = dir_str.to_lowercase();
-
     let parts: Vec<&str> = current_path
         .split(';')
-        .filter(|part| part.trim().to_lowercase() != dir_str_lower)
+        .filter(|part| !path_entry_matches_dir(part, dir))
         .collect();
     if parts.len() != current_path.split(';').count() {
         let new_path = parts.join(";");
@@ -723,6 +735,19 @@ mod tests {
             startup_command(path),
             r#""C:\Users\John Doe\AppData\Local\COPE\cope.exe" daemon"#
         );
+    }
+
+    #[test]
+    fn test_path_entry_matches_long_path_prefixed_directory() {
+        let dir = std::path::Path::new(r"C:\Users\lukfi\AppData\Local\COPE");
+        assert!(path_entry_matches_dir(
+            r"\\?\C:\Users\lukfi\AppData\Local\COPE",
+            dir
+        ));
+        assert!(!path_entry_matches_dir(
+            r"C:\Users\lukfi\AppData\Local\Other",
+            dir
+        ));
     }
 
     #[test]

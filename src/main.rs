@@ -60,7 +60,7 @@ fn main() {
         println!("{}", Cli::help());
         process::exit(0);
     } else if matches!(cli.command, Commands::Version) {
-        println!("cope v0.1.0");
+        println!("cope v0.1.1");
         process::exit(0);
     } else {
         env_logger::init_from_env(env_logger::Env::default().default_filter_or("warn"));

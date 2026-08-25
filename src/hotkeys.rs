@@ -35,6 +35,7 @@ pub struct HotkeyManager {
     failed_registrations: Vec<String>,
     current_ca: Option<SolanaAddress>,
     last_clipboard_text: Option<String>,
+    last_clipboard_sequence: Option<u32>,
     pending_clipboard_restore: Option<String>,
     history: History,
 }
@@ -52,6 +53,7 @@ impl HotkeyManager {
             failed_registrations: Vec::new(),
             current_ca: None,
             last_clipboard_text: None,
+            last_clipboard_sequence: None,
             pending_clipboard_restore: None,
             history,
         })
@@ -159,10 +161,13 @@ impl HotkeyManager {
         }
 
         if let Some(before) = self.pending_clipboard_restore.take() {
-            let _ = self.write_clipboard(&before.clone());
-            // Update last_clipboard_text so the next hotkey invocation does NOT
-            // mistake our own restore for a manual clipboard change.
-            self.last_clipboard_text = Some(before);
+            if let Err(e) = self.write_clipboard(&before) {
+                warn!("Failed to restore clipboard: {}", e);
+            } else {
+                // Remember COPE's own restore so it is not mistaken for a
+                // new user copy on the next hotkey press.
+                self.remember_clipboard(before);
+            }
         }
 
         if let Some(f) = feedback {
@@ -188,9 +193,9 @@ impl HotkeyManager {
     /// Resolve which CA to route for this hotkey press.
     ///
     /// Invariants:
-    ///   0 valid fresh CAs -> do not overwrite current_ca, return (None, false, feedback)
+    ///   0 valid fresh CAs -> keep current_ca and use it when available
     ///   1 valid fresh CA  -> update current_ca, return (Some(ca), true, None)
-    ///   2+ valid fresh CAs -> do not guess, return (None, false, feedback)
+    ///   2+ valid fresh CAs -> keep current_ca and use it when available
     ///   no fresh selection -> reuse current_ca if present
     ///
     /// On success path (should_route=true), sets self.pending_clipboard_restore
@@ -199,22 +204,27 @@ impl HotkeyManager {
         &mut self,
         _destination: Destination,
     ) -> (Option<SolanaAddress>, bool, Option<String>) {
-        let (selected_text, _user_selection, text_before, _clipboard_sequence_before) =
+        let (selected_text, _user_selection, text_before, clipboard_sequence_before) =
             self.try_get_selected_ca();
 
         if let Some(text) = selected_text {
             let (addr, feedback) = Self::try_extract_address(&text);
             if let Some(addr) = addr {
                 self.current_ca = Some(addr.clone());
-                self.last_clipboard_text = Some(text);
+                self.last_clipboard_text =
+                    Some(text_before.clone().unwrap_or_else(|| text.clone()));
+                self.last_clipboard_sequence = Some(if text_before.is_some() {
+                    clipboard_sequence_before
+                } else {
+                    self.current_clipboard_sequence()
+                });
                 self.pending_clipboard_restore = text_before;
                 (Some(addr), true, None)
             } else {
                 if let Some(before) = text_before {
-                    let _ = self.write_clipboard(&before);
-                    self.last_clipboard_text = Some(before);
+                    self.restore_clipboard(before);
                 }
-                (None, false, feedback)
+                self.use_current_ca(feedback)
             }
         } else {
             // `text_before` is the clipboard state before COPE synthesized
@@ -233,6 +243,8 @@ impl HotkeyManager {
             let clipboard_changed = clipboard_changed_since(
                 self.last_clipboard_text.as_deref(),
                 &current_clipboard_text,
+                self.last_clipboard_sequence,
+                clipboard_sequence_before,
             );
 
             // A changed clipboard is a new user-copied coin and must replace
@@ -242,22 +254,48 @@ impl HotkeyManager {
                 let (addr, feedback) = Self::try_extract_address(&current_clipboard_text);
                 if let Some(addr) = addr {
                     self.current_ca = Some(addr.clone());
-                    self.last_clipboard_text = Some(current_clipboard_text);
+                    self.remember_clipboard(current_clipboard_text);
                     (Some(addr), true, None)
                 } else {
-                    (None, false, feedback)
+                    self.remember_clipboard(current_clipboard_text);
+                    self.use_current_ca(feedback)
                 }
-            } else if let Some(ref addr) = self.current_ca {
+            } else if let Some(addr) = self.current_ca.clone() {
                 // No selection and no new clipboard change: reuse the most
                 // recently selected or copied coin.
-                self.last_clipboard_text = Some(current_clipboard_text);
-                (Some(addr.clone()), true, None)
+                self.remember_clipboard(current_clipboard_text);
+                (Some(addr), true, None)
             } else {
                 (None, false, Some("No Solana CA found.".to_string()))
             }
         }
     }
 
+    /// Keep the last successful CA authoritative across all input paths.
+    /// A failed or ambiguous fresh capture must never erase it.
+    fn use_current_ca(
+        &self,
+        feedback: Option<String>,
+    ) -> (Option<SolanaAddress>, bool, Option<String>) {
+        sticky_resolution(self.current_ca.as_ref(), feedback)
+    }
+
+    fn current_clipboard_sequence(&self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+
+    fn remember_clipboard(&mut self, text: String) {
+        self.last_clipboard_text = Some(text);
+        self.last_clipboard_sequence = Some(self.current_clipboard_sequence());
+    }
+
+    fn restore_clipboard(&mut self, text: String) {
+        if let Err(e) = self.write_clipboard(&text) {
+            warn!("Failed to restore clipboard: {}", e);
+        } else {
+            self.remember_clipboard(text);
+        }
+    }
     /// Capture selected text via Ctrl+C synthesis.
     ///
     /// Snapshot clipboard, wait for Alt release, inject Ctrl+C, then read the
@@ -277,16 +315,11 @@ impl HotkeyManager {
 
         let text_after = self.wait_for_clipboard_change(seq_before, 150);
 
-        let user_selection = match (&text_before, &text_after) {
-            (Some(b), Some(a)) => b != a && !a.trim().is_empty(),
-            _ => false,
-        };
-
-        let selected_text = if user_selection {
-            text_after.clone()
-        } else {
-            None
-        };
+        // A changed clipboard sequence means Ctrl+C produced fresh content.
+        // Do not require the text itself to differ: the user may have
+        // selected/copied the same CA that was already on the clipboard.
+        let selected_text = text_after.filter(|text| !text.trim().is_empty());
+        let user_selection = selected_text.is_some();
 
         (selected_text, user_selection, text_before, seq_before)
     }
@@ -439,11 +472,25 @@ impl HotkeyManager {
     }
 }
 
+fn sticky_resolution(
+    current_ca: Option<&SolanaAddress>,
+    feedback: Option<String>,
+) -> (Option<SolanaAddress>, bool, Option<String>) {
+    if let Some(addr) = current_ca {
+        (Some(addr.clone()), true, None)
+    } else {
+        (None, false, feedback)
+    }
+}
+
 fn clipboard_changed_since(
     last_clipboard_text: Option<&str>,
     current_clipboard_text: &str,
+    last_clipboard_sequence: Option<u32>,
+    current_clipboard_sequence: u32,
 ) -> bool {
     last_clipboard_text != Some(current_clipboard_text)
+        || last_clipboard_sequence != Some(current_clipboard_sequence)
 }
 
 impl Drop for HotkeyManager {
@@ -555,13 +602,57 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_fresh_text_keeps_last_ca_available() {
+        let current = SolanaAddress(VALID_CA.to_string());
+        let (fresh, feedback) = HotkeyManager::try_extract_address("not a CA");
+
+        assert!(fresh.is_none());
+        assert!(feedback.is_some());
+        let (resolved, should_route, resolver_feedback) =
+            sticky_resolution(Some(&current), feedback);
+        assert_eq!(resolved, Some(current));
+        assert!(should_route);
+        assert!(resolver_feedback.is_none());
+    }
+
+    #[test]
+    fn test_ambiguous_fresh_text_keeps_last_ca_available() {
+        let current = SolanaAddress(VALID_CA.to_string());
+        let text = format!("{} {}", VALID_CA, VALID_CA_2);
+        let (fresh, feedback) = HotkeyManager::try_extract_address(&text);
+
+        assert!(fresh.is_none());
+        let (resolved, should_route, resolver_feedback) =
+            sticky_resolution(Some(&current), feedback);
+        assert_eq!(resolved, Some(current));
+        assert!(should_route);
+        assert!(resolver_feedback.is_none());
+    }
+
+    #[test]
     fn test_newly_copied_clipboard_replaces_sticky_snapshot() {
-        assert!(clipboard_changed_since(Some(VALID_CA), VALID_CA_2));
+        assert!(clipboard_changed_since(
+            Some(VALID_CA),
+            VALID_CA_2,
+            Some(10),
+            10
+        ));
+        assert!(clipboard_changed_since(
+            Some(VALID_CA),
+            VALID_CA,
+            Some(10),
+            11
+        ));
     }
 
     #[test]
     fn test_unchanged_clipboard_reuses_sticky_snapshot() {
-        assert!(!clipboard_changed_since(Some(VALID_CA), VALID_CA));
-        assert!(clipboard_changed_since(None, VALID_CA));
+        assert!(!clipboard_changed_since(
+            Some(VALID_CA),
+            VALID_CA,
+            Some(10),
+            10
+        ));
+        assert!(clipboard_changed_since(None, VALID_CA, None, 10));
     }
 }
