@@ -39,10 +39,12 @@ jobs:
 
       - name: Verify binary
         run: |
-          $sha = (Get-FileHash -Algorithm SHA256 target/release/cope.exe).Hash
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/cope.exe dist/cope-windows-x64.exe -Force
+          $sha = (Get-FileHash -Algorithm SHA256 dist/cope-windows-x64.exe).Hash
           Write-Host "SHA256: $sha"
 
       - uses: actions/upload-artifact@v4
         with:
           name: cope-windows-x64
-          path: target/release/cope.exe
+          path: dist/cope-windows-x64.exe

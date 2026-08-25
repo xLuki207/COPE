@@ -71,7 +71,13 @@ impl Cli {
             println!("{}", Self::help());
             std::process::exit(0);
         } else {
-            Commands::from_str(&args).unwrap_or(Commands::Status)
+            match Commands::from_str(&args) {
+                Some(command) => command,
+                None => {
+                    eprintln!("Unknown command '{}'. Run 'cope help' for usage.", args[0]);
+                    std::process::exit(2);
+                }
+            }
         };
         Self { command }
     }
@@ -335,7 +341,7 @@ fn cmd_history(all: bool, clear: bool) -> Result<()> {
     }
 
     println!(
-        "  {DIM}#   {:<52} DATE / TIME (UTC){RESET}",
+        "  {DIM}#   {:<52} DATE / TIME (EST){RESET}",
         "CONTRACT ADDRESS"
     );
     println!("  {}", "-".repeat(72));

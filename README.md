@@ -43,7 +43,8 @@ After installation, open a new terminal to use the `cope` command.
 - The latest valid CA that was either copied or selected becomes the current CA.
   Empty or ambiguous selections do not replace it.
 - COPE restores the clipboard after selection capture and records successful
-  routes in local JSONL history. History timestamps are shown and stored in UTC.
+  routes in local JSONL history. History timestamps are shown and stored in EST
+  (Eastern Standard Time, UTC-5).
 
 ## Commands
 
